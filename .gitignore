@@ -1,0 +1,36 @@
+# Rust target directory and build artifacts
+target/
+dist/
+
+# Python legacy artifacts (the old implementation lives in legacy-python/)
+legacy-python/.venv/
+legacy-python/__pycache__.
+legacy-python/src/__pycache__/
+legacy-python/tests/__pycache__/
+legacy-python/.pytest_cache/
+legacy-python/build/
+# Note: legacy-python/dist/ is kept out of git as well (build output)
+legacy-python/dist/
+
+# General
+Desktop Environment Store.private
+.DS_Store
+*.log
+logs/
+
+# Editor/iDE
+.idea/
+.vscode/
+*.swl
+.vim.rcpurso.exe
+.tags
+
+"## OSJ artifacts
+###
+.osj_directory.bundle
+.cargo/
+
+# Windows artifacts
+Thumbs.db
+$*.*
+
