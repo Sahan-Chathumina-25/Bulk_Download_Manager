@@ -1150,3 +1150,117 @@ async fn concurrent_completions_leave_no_pending_slots() {
     }
     assert_eq!(site.hits("/slow"), 3);
 }
+
+// 38
+/// Rows parked in `Connecting`/`Downloading` right now.
+fn live_count(harness: &Harness) -> usize {
+    harness
+        .repository
+        .list_all()
+        .expect("list downloads")
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.state,
+                DownloadState::Connecting | DownloadState::Downloading
+            )
+        })
+        .count()
+}
+
+/// `apply_settings` must hand the freed slots to queued rows without the UI
+/// having to call `start_all` again.
+#[tokio::test]
+async fn apply_settings_raising_the_cap_starts_queued_rows() {
+    let site = FakeSite::spawn().await;
+    let mut settings = settings_for(&temp_dir("apply-raise-settings"));
+    settings.max_simultaneous = 1;
+    // Stalls never answer, so nothing can complete and mask the dispatch.
+    settings.connection_timeout = 30.0;
+    let harness = harness("apply-raise", settings.clone());
+
+    for index in 0..3 {
+        let dir = harness.dir.join(format!("slot{index}"));
+        std::fs::create_dir_all(&dir).expect("slot dir");
+        harness
+            .manager
+            .add_download(&site.url("/stall"), None, Some(&dir), None)
+            .expect("add download");
+    }
+
+    assert_eq!(harness.manager.start_all(), 1);
+    // The worker only writes `Connecting` once it starts, so wait for it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while live_count(&harness) < 1 {
+        assert!(Instant::now() < deadline, "the first row never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let mut raised = settings;
+    raised.max_simultaneous = 3;
+    harness.manager.apply_settings(raised);
+
+    assert_eq!(harness.manager.max_simultaneous(), 3);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while live_count(&harness) < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "only {} of 3 rows started after raising the cap",
+            live_count(&harness)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    harness.manager.shutdown().await;
+}
+
+// 39
+/// Lowering the cap must not dispatch anything extra even though slots are
+/// still occupied by transfers that started under the old limit.
+#[tokio::test]
+async fn apply_settings_lowering_the_cap_blocks_new_dispatches() {
+    let site = FakeSite::spawn().await;
+    let mut settings = settings_for(&temp_dir("apply-lower-settings"));
+    settings.max_simultaneous = 3;
+    settings.connection_timeout = 30.0;
+    let harness = harness("apply-lower", settings.clone());
+
+    for index in 0..3 {
+        let dir = harness.dir.join(format!("slot{index}"));
+        std::fs::create_dir_all(&dir).expect("slot dir");
+        harness
+            .manager
+            .add_download(&site.url("/stall"), None, Some(&dir), None)
+            .expect("add download");
+    }
+
+    assert_eq!(harness.manager.start_all(), 3);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while live_count(&harness) < 3 {
+        assert!(Instant::now() < deadline, "three rows never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let mut lowered = settings;
+    lowered.max_simultaneous = 1;
+    harness.manager.apply_settings(lowered);
+    assert_eq!(harness.manager.max_simultaneous(), 1);
+
+    // A fourth row is queued, but the lowered cap is already exceeded by the
+    // three running transfers, so nothing may start.
+    let dir = harness.dir.join("slot3");
+    std::fs::create_dir_all(&dir).expect("slot dir");
+    let queued = harness
+        .manager
+        .add_download(&site.url("/stall"), None, Some(&dir), None)
+        .expect("add download");
+
+    assert_eq!(harness.manager.start_all(), 0);
+    assert_eq!(
+        harness.record(queued.id.expect("id")).state,
+        DownloadState::Queued
+    );
+    assert_eq!(live_count(&harness), 3);
+
+    harness.manager.shutdown().await;
+}

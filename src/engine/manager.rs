@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -82,7 +82,9 @@ impl QueueScheduler {
 
 /// State shared by every clone of a [`DownloadManager`].
 struct ManagerInner {
-    settings: Settings,
+    /// Mutable so the UI can apply settings without rebuilding the manager.
+    /// Workers receive a clone at dispatch time and keep that snapshot.
+    settings: RwLock<Settings>,
     repository: Arc<DownloadRepository>,
     scheduler: Arc<QueueScheduler>,
     events: mpsc::UnboundedSender<EngineEvent>,
@@ -94,7 +96,7 @@ struct ManagerInner {
 
 impl ManagerInner {
     fn max_simultaneous(&self) -> usize {
-        self.settings
+        read_settings(&self.settings)
             .max_simultaneous
             .clamp(1, MAX_SIMULTANEOUS_LIMIT) as usize
     }
@@ -163,12 +165,15 @@ impl ManagerInner {
         // A retried row may still carry a stale failure summary; workers only
         // clear it on success, so normalise the starting point here.
         record.error_summary = None;
+        // Snapshot the settings for this worker: later changes must not affect
+        // work already in flight.
+        let settings = read_settings(&self.settings).clone();
         let worker = DownloadWorker::new(
             record,
-            self.settings.clone(),
+            settings.clone(),
             Some(Arc::clone(&self.repository)),
             Some(Arc::new(PinningResolver::new(
-                self.settings.allow_private_addresses,
+                settings.allow_private_addresses,
             ))),
             Some(self.events.clone()),
             cancel,
@@ -200,7 +205,7 @@ impl DownloadManager {
     pub fn new(settings: Settings, repository: Arc<DownloadRepository>) -> Self {
         let (events, event_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(ManagerInner {
-            settings,
+            settings: RwLock::new(settings),
             repository,
             scheduler: Arc::new(QueueScheduler::new()),
             events,
@@ -233,8 +238,25 @@ impl DownloadManager {
     }
 
     /// The settings snapshot used for spawned workers.
-    pub fn settings(&self) -> &Settings {
-        &self.inner.settings
+    ///
+    /// Returns an owned clone because the live settings sit behind a lock;
+    /// callers that only need one field should read it via this value.
+    pub fn settings(&self) -> Settings {
+        read_settings(&self.inner.settings).clone()
+    }
+
+    /// Replace the settings used for future dispatches.
+    ///
+    /// Running workers keep the snapshot they were spawned with, so a change
+    /// never rewrites an in-flight transfer mid-stream. The concurrency cap,
+    /// however, is re-read on every dispatch: raising it starts more queued
+    /// rows immediately, and lowering it takes effect as slots free up.
+    ///
+    /// This does not persist anything — the caller owns the repository write.
+    pub fn apply_settings(&self, settings: Settings) {
+        *lock_rw(&self.inner.settings) = settings;
+        // A raised cap may have left queued rows waiting for a slot.
+        self.inner.pump();
     }
 
     /// Insert a queued download and return the persisted record.
@@ -251,17 +273,14 @@ impl DownloadManager {
         checksum_sha256: Option<&str>,
     ) -> Result<DownloadRecord, String> {
         let checksum = normalize_checksum(checksum_sha256)?;
+        // One snapshot for the whole call keeps destination and collision
+        // policy consistent even if the UI saves settings mid-add.
+        let settings = self.settings();
 
         let directory = match destination_dir {
             Some(dir) => dir.to_path_buf(),
-            None if !self
-                .inner
-                .settings
-                .default_destination_dir
-                .trim()
-                .is_empty() =>
-            {
-                PathBuf::from(&self.inner.settings.default_destination_dir)
+            None if !settings.default_destination_dir.trim().is_empty() => {
+                PathBuf::from(&settings.default_destination_dir)
             }
             None => {
                 return Err(
@@ -273,8 +292,7 @@ impl DownloadManager {
 
         let filename = file_naming::filename_from_url(url);
         let destination = file_naming::resolve_destination(&directory, &filename);
-        let Some(resolved) =
-            file_naming::unique_path(&destination, self.inner.settings.filename_collision)
+        let Some(resolved) = file_naming::unique_path(&destination, settings.filename_collision)
         else {
             let name = destination
                 .file_name()
@@ -506,6 +524,20 @@ impl DownloadManager {
 /// Lock a mutex, recovering from poisoning instead of panicking.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Lock the settings for writing, recovering from poisoning.
+fn lock_rw<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Borrow the settings for reading, recovering from poisoning.
+///
+/// The returned guard borrows from `settings`, so callers must clone out of it
+/// before doing anything that could take the write lock (notably spawning a
+/// worker or applying new settings).
+fn read_settings(settings: &RwLock<Settings>) -> RwLockReadGuard<'_, Settings> {
+    settings.read().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Normalise a SHA-256 checksum or explain why it is unusable.
