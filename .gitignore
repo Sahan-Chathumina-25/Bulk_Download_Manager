@@ -34,3 +34,8 @@ logs/
 Thumbs.db
 $*.*
 
+
+
+# Added by cargo
+
+/target

@@ -1,0 +1,4 @@
+# Pin the project to a stable Rust toolchain.
+# The development machine has 1.97.1 installed; any newer stable works.
+[toolchain]
+channel = "stable"
