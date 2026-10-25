@@ -81,11 +81,8 @@ mod tests {
 
     #[test]
     fn new_queued_sets_state_and_timestamp() {
-        let record = DownloadRecord::new_queued(
-            "http://example.com/a.zip",
-            "a.zip",
-            "C:/tmp/a.zip",
-        );
+        let record =
+            DownloadRecord::new_queued("http://example.com/a.zip", "a.zip", "C:/tmp/a.zip");
         assert_eq!(record.state, DownloadState::Queued);
         assert_eq!(record.source_url, "http://example.com/a.zip");
         assert!(record.created_at.contains("T"));

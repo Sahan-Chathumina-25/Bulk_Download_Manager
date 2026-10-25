@@ -14,10 +14,10 @@ pub const DEFAULT_USER_AGENT: &str = "BulkDownloadManager/0.1 (Windows; +VEEDIZ 
 
 /// Extensions the Discover page counts as likely files by default.
 pub const DEFAULT_ALLOWED_EXTENSIONS: [&str; 41] = [
-    "zip", "rar", "7z", "iso", "pdf", "epub", "exe", "msi", "dmg", "img", "tar", "gz", "xz",
-    "bz2", "mp3", "mp4", "mkv", "avi", "mov", "wav", "flac", "jpg", "jpeg", "png", "gif",
-    "webp", "svg", "tif", "bmp", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv", "txt",
-    "json", "xml", "apk", "ipa",
+    "zip", "rar", "7z", "iso", "pdf", "epub", "exe", "msi", "dmg", "img", "tar", "gz", "xz", "bz2",
+    "mp3", "mp4", "mkv", "avi", "mov", "wav", "flac", "jpg", "jpeg", "png", "gif", "webp", "svg",
+    "tif", "bmp", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv", "txt", "json", "xml", "apk",
+    "ipa",
 ];
 
 /// What to do when the destination file already exists.
@@ -223,19 +223,45 @@ mod tests {
 
     #[test]
     fn validation_clamps_and_rejects() {
-        let settings = Settings { max_simultaneous: 99, ..Settings::default() };
+        let settings = Settings {
+            max_simultaneous: 99,
+            ..Settings::default()
+        };
         assert_eq!(settings.validated().unwrap().max_simultaneous, 10);
-        let settings = Settings { max_simultaneous: 0, ..Settings::default() };
+        let settings = Settings {
+            max_simultaneous: 0,
+            ..Settings::default()
+        };
         assert_eq!(settings.validated().unwrap().max_simultaneous, 1);
-        let settings = Settings { retry_count: 21, ..Settings::default() };
+        let settings = Settings {
+            retry_count: 21,
+            ..Settings::default()
+        };
         assert!(settings.validated().unwrap_err().contains("retry_count"));
-        let settings = Settings { connection_timeout: 0.0, ..Settings::default() };
-        assert!(settings.validated().unwrap_err().contains("connection_timeout"));
-        let settings = Settings { retry_delay: -1.0, ..Settings::default() };
+        let settings = Settings {
+            connection_timeout: 0.0,
+            ..Settings::default()
+        };
+        assert!(
+            settings
+                .validated()
+                .unwrap_err()
+                .contains("connection_timeout")
+        );
+        let settings = Settings {
+            retry_delay: -1.0,
+            ..Settings::default()
+        };
         assert!(settings.validated().unwrap_err().contains("retry_delay"));
-        let settings = Settings { buffer_size: 0, ..Settings::default() };
+        let settings = Settings {
+            buffer_size: 0,
+            ..Settings::default()
+        };
         assert!(settings.validated().unwrap_err().contains("buffer_size"));
-        let settings = Settings { user_agent: "   ".to_string(), ..Settings::default() };
+        let settings = Settings {
+            user_agent: "   ".to_string(),
+            ..Settings::default()
+        };
         assert!(settings.validated().unwrap_err().contains("user_agent"));
     }
 
@@ -244,18 +270,37 @@ mod tests {
         let mut exts = BTreeSet::new();
         exts.insert(" .ZIP ".to_string());
         exts.insert("..zip".to_string());
-        let settings = Settings { allowed_extensions: exts, ..Settings::default() };
+        let settings = Settings {
+            allowed_extensions: exts,
+            ..Settings::default()
+        };
         let validated = settings.validated().unwrap();
         assert!(validated.allowed_extensions.contains("zip"));
         assert_eq!(validated.allowed_extensions.len(), 1);
         let mut bad = BTreeSet::new();
         bad.insert("toolongext1".to_string());
-        let settings = Settings { allowed_extensions: bad, ..Settings::default() };
-        assert!(settings.validated().unwrap_err().contains("invalid allowed extension"));
+        let settings = Settings {
+            allowed_extensions: bad,
+            ..Settings::default()
+        };
+        assert!(
+            settings
+                .validated()
+                .unwrap_err()
+                .contains("invalid allowed extension")
+        );
         let mut bad = BTreeSet::new();
         bad.insert("zip!".to_string());
-        let settings = Settings { allowed_extensions: bad, ..Settings::default() };
-        assert!(settings.validated().unwrap_err().contains("invalid allowed extension"));
+        let settings = Settings {
+            allowed_extensions: bad,
+            ..Settings::default()
+        };
+        assert!(
+            settings
+                .validated()
+                .unwrap_err()
+                .contains("invalid allowed extension")
+        );
     }
 }
 
@@ -279,7 +324,7 @@ mod json_tests {
     fn from_json_python_document() {
         // A document written by the Python app (snake_case keys, sorted).
         let raw = r#"{"allowed_extensions":["zip","pdf"],"bandwidth_limit_bps":0,"buffer_size":65536,"connection_timeout":15.0,"default_destination_dir":"","filename_collision":"rename","include_unknown_types":false,"max_simultaneous":5,"notifications":false,"respect_rate_limit":true,"retry_count":2,"retry_delay":1.0,"theme":"light","user_agent":"test-agent"}"#;
-        let settings = Settings::from_json(&raw).unwrap();
+        let settings = Settings::from_json(raw).unwrap();
         assert_eq!(settings.max_simultaneous, 5);
         assert_eq!(settings.theme, Theme::Light);
         assert_eq!(settings.filename_collision, CollisionPolicy::Rename);

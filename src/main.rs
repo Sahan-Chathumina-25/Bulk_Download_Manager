@@ -5,6 +5,13 @@
 
 // Hide the console window for release builds on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Core modules ported so far; the app wiring consumes them in later phases.
+#![allow(dead_code)]
+
+mod config;
+mod errors;
+mod models;
+mod services;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {

@@ -69,8 +69,9 @@ fn truncate_preserving_extension(name: &str) -> String {
 
 /// Derive a filename from a URL path (fragment+query stripped, decoded).
 pub fn filename_from_url(url: &str) -> String {
-    let basename = url_path_segment(url);
-    let decoded = percent_encoding::percent_decode_str(&basename).decode_utf8_lossy();
+    let path = url_path_segment(url);
+    let basename = path.rsplit('/').next().unwrap_or("");
+    let decoded = percent_encoding::percent_decode_str(basename).decode_utf8_lossy();
     sanitize_filename(&decoded)
 }
 
@@ -103,7 +104,10 @@ pub fn resolve_destination(destination_dir: &Path, filename: &str) -> PathBuf {
     // sanitize_filename already yields a single safe component; the parent
     // check below is defence in depth mirroring the Python resolve()
     // comparison.
-    let inside = candidate.parent().map(|parent| parent == base).unwrap_or(false);
+    let inside = candidate
+        .parent()
+        .map(|parent| parent == base)
+        .unwrap_or(false);
     if inside {
         candidate
     } else {
@@ -126,7 +130,9 @@ fn expand_and_normalise(dir: &Path) -> PathBuf {
     let expanded = if expanded.is_absolute() {
         expanded
     } else {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from('.')).join(expanded)
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(expanded)
     };
     let mut out = PathBuf::new();
     for component in expanded.components() {
@@ -146,7 +152,7 @@ fn home_dir() -> PathBuf {
     std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from('.'))
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Apply a filename-collision policy and return the path to write to.
@@ -170,18 +176,22 @@ pub fn unique_path(path: &Path, policy: CollisionPolicy) -> Option<PathBuf> {
 
 /// Return the first free stem (n).ext variant of an existing path.
 fn next_free_variant(path: &Path) -> PathBuf {
-    let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let stem = path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
     let suffix = path
         .extension()
         .map(|ext| format!(".{}", ext.to_string_lossy()))
         .unwrap_or_default();
     for n in 1..1000 {
-        let candidate = path.with_name(format!("{stem} ({n}){suffix}"));
+        let candidate = path.with_file_name(format!("{stem} ({n}){suffix}"));
         if !candidate.exists() {
             return candidate;
         }
     }
-    path.with_name(format!("{stem} (too-many){suffix}"))
+    path.with_file_name(format!("{stem} (too-many){suffix}"))
 }
 
 /// True if name is a reserved Windows device name (CON, LPT2, ...).
@@ -219,15 +229,15 @@ pub fn classify_extension(url_or_name: &str) -> Option<String> {
     if !basename.contains('.') {
         return None;
     }
-    let ext = basename.rsplit('.').next().unwrap_or("").trim().to_lowercase();
-    let plausible = !ext.is_empty()
-        && ext.chars().count() <= 10
-        && ext.chars().all(|c| c.is_alphanumeric());
-    if plausible {
-        Some(ext)
-    } else {
-        None
-    }
+    let ext = basename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    let plausible =
+        !ext.is_empty() && ext.chars().count() <= 10 && ext.chars().all(|c| c.is_alphanumeric());
+    if plausible { Some(ext) } else { None }
 }
 
 #[cfg(test)]
@@ -252,7 +262,10 @@ mod tests {
 
     #[test]
     fn control_characters_replaced() {
-        assert_eq!(sanitize_filename("bad\u{0}\u{1}\u{1f}\u{7f}name"), "bad____name");
+        assert_eq!(
+            sanitize_filename("bad\u{0}\u{1}\u{1f}\u{7f}name"),
+            "bad____name"
+        );
     }
 
     #[test]
@@ -294,3 +307,174 @@ mod tests {
             assert_eq!(sanitize_filename(empty), FALLBACK_NAME);
         }
     }
+
+    #[test]
+    fn long_input_clamped_to_200() {
+        let plain = sanitize_filename(&"a".repeat(250));
+        assert_eq!(plain.chars().count(), MAX_FILENAME_LEN);
+        assert!(plain.chars().count() <= 200);
+
+        let with_ext = sanitize_filename(&format!("{}.zip", "b".repeat(250)));
+        assert!(with_ext.chars().count() <= MAX_FILENAME_LEN);
+        assert!(with_ext.ends_with(".zip"));
+    }
+
+    #[test]
+    fn long_input_with_implausible_extension_just_clamped() {
+        let name = sanitize_filename(&format!("{}.{}", "c".repeat(250), "x".repeat(11)));
+        assert_eq!(name.chars().count(), MAX_FILENAME_LEN);
+        assert!(!name.ends_with(&format!(".{}", "x".repeat(11))));
+    }
+
+    #[test]
+    fn filename_from_url_strips_query_and_fragment_and_decodes() {
+        let url = "https://example.com/dir/report%202024.zip?token=x&y=1#frag";
+        assert_eq!(filename_from_url(url), "report 2024.zip");
+    }
+
+    #[test]
+    fn filename_from_url_query_only_urls() {
+        assert_eq!(
+            filename_from_url("https://example.com/f.pdf?x=1&y=2"),
+            "f.pdf"
+        );
+    }
+
+    #[test]
+    fn filename_from_url_fallbacks() {
+        for url in ["https://example.com/", "http://example.com", "http://["] {
+            assert_eq!(filename_from_url(url), FALLBACK_NAME, "url: {url}");
+        }
+    }
+
+    #[test]
+    fn filename_from_url_sanitises_hostile_names() {
+        assert_eq!(
+            filename_from_url("https://example.com/win/CON.zip"),
+            "_CON.zip"
+        );
+    }
+
+    #[test]
+    fn unique_path_nonexistent_returns_desired_path() {
+        let dir = tmp_dir("unique-nonexistent");
+        let desired = dir.join("new.txt");
+        for policy in [
+            CollisionPolicy::KeepExisting,
+            CollisionPolicy::Rename,
+            CollisionPolicy::Overwrite,
+            CollisionPolicy::Skip,
+        ] {
+            assert_eq!(unique_path(&desired, policy), Some(desired.clone()));
+        }
+    }
+
+    #[test]
+    fn unique_path_keep_existing_and_overwrite_keep_path() {
+        let dir = tmp_dir("unique-keep-overwrite");
+        let path = dir.join("file.txt");
+        std::fs::write(&path, "x").unwrap();
+        assert_eq!(
+            unique_path(&path, CollisionPolicy::KeepExisting),
+            Some(path.clone())
+        );
+        assert_eq!(
+            unique_path(&path, CollisionPolicy::Overwrite),
+            Some(path.clone())
+        );
+    }
+
+    #[test]
+    fn unique_path_skip_returns_none() {
+        let dir = tmp_dir("unique-skip");
+        let path = dir.join("file.txt");
+        std::fs::write(&path, "x").unwrap();
+        assert_eq!(unique_path(&path, CollisionPolicy::Skip), None);
+    }
+
+    #[test]
+    fn unique_path_rename_finds_free_variant() {
+        let dir = tmp_dir("unique-rename");
+        let path = dir.join("file.txt");
+        std::fs::write(&path, "x").unwrap();
+
+        let first = unique_path(&path, CollisionPolicy::Rename).unwrap();
+        assert_eq!(first, dir.join("file (1).txt"));
+        std::fs::write(&first, "y").unwrap();
+
+        let second = unique_path(&path, CollisionPolicy::Rename).unwrap();
+        assert_eq!(second, dir.join("file (2).txt"));
+        assert!(!second.exists());
+    }
+
+    #[test]
+    fn unique_path_rename_multi_extension() {
+        let dir = tmp_dir("unique-rename-multi");
+        let path = dir.join("archive.tar.gz");
+        std::fs::write(&path, "z").unwrap();
+        assert_eq!(
+            unique_path(&path, CollisionPolicy::Rename),
+            Some(dir.join("archive.tar (1).gz"))
+        );
+    }
+
+    #[test]
+    fn resolve_destination_blocks_traversal() {
+        let base = tmp_dir("resolve-traversal");
+        for hostile in ["../../evil.exe", "..\\..\\evil.exe"] {
+            let path = resolve_destination(&base, hostile);
+            assert!(path.starts_with(&base), "{path:?} escaped {base:?}");
+            assert_eq!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some(".._.._evil.exe"),
+                "hostile input: {hostile}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_destination_normal_relative_path() {
+        let base = tmp_dir("resolve-normal");
+        let path = resolve_destination(&base, "report 2024.zip");
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("report 2024.zip")
+        );
+        assert!(path.starts_with(&base));
+
+        let nested = resolve_destination(&base, "sub/dir/file.zip");
+        assert_eq!(
+            nested.file_name().and_then(|name| name.to_str()),
+            Some("sub_dir_file.zip")
+        );
+        assert!(nested.starts_with(&base));
+    }
+
+    #[test]
+    fn classify_extension_matches_python() {
+        let too_long = format!("too.long.{}", "x".repeat(11));
+        let cases: [(&str, Option<&str>); 11] = [
+            (
+                "http://example.com/files/photo.PNG?dl=1#section",
+                Some("png"),
+            ),
+            ("file.zip", Some("zip")),
+            ("archive.tar.gz", Some("gz")),
+            ("dir\\interop.docx", Some("docx")),
+            ("  spaced.TXT  ", Some("txt")),
+            ("missing", None),
+            ("trailing.", None),
+            (too_long.as_str(), None),
+            ("http://example.com/dir/", None),
+            ("", None),
+            (".gitignore", Some("gitignore")),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                classify_extension(text).as_deref(),
+                expected,
+                "text: {text:?}"
+            );
+        }
+    }
+}

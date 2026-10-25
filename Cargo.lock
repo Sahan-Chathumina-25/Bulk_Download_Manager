@@ -10,6 +10,7 @@ dependencies = [
  "chrono",
  "eframe",
  "egui",
+ "form_urlencoded",
  "httpdate",
  "percent-encoding",
  "reqwest",
