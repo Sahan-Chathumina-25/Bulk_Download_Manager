@@ -10,6 +10,7 @@
 
 mod config;
 mod database;
+mod engine;
 mod errors;
 mod models;
 mod services;
