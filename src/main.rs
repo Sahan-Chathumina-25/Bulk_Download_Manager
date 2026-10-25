@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 mod config;
+mod database;
 mod errors;
 mod models;
 mod services;

@@ -8,7 +8,7 @@ use super::download_status::DownloadState;
 ///
 /// Field-for-field port of the Python DownloadRecord dataclass; the
 /// storage layer maps these fields onto the downloads table columns.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DownloadRecord {
     pub id: Option<i64>,
     pub source_url: String,
