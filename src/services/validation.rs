@@ -107,7 +107,11 @@ fn is_private_v6(ip: &Ipv6Addr) -> bool {
 }
 
 /// True if the address is private/loopback/link-local.
-fn is_private(ip: &IpAddr) -> bool {
+///
+/// `pub(crate)` so [`crate::engine::resolver`] can apply the same policy to
+/// addresses discovered at connection time (the DNS-pinning half of the
+/// rebinding defence).
+pub(crate) fn is_private(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_private_v4(v4),
         IpAddr::V6(v6) => is_private_v6(v6),

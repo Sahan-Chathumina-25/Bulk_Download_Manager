@@ -48,8 +48,9 @@ use crate::models::download_item::{DownloadRecord, now_iso};
 use crate::models::download_status::DownloadState;
 use crate::services::{file_naming, validation};
 
-use super::client::build_client;
+use super::client::build_client_with_resolver;
 use super::progress::DownloadProgress;
+use super::resolver::PinningResolver;
 use super::retry::{RetryOutcome, RetryPolicy, TRANSIENT_STATUS_CODES, parse_retry_after};
 
 /// Maximum number of redirect hops (the worker makes at most one more
@@ -173,6 +174,7 @@ pub struct DownloadWorker {
     record: DownloadRecord,
     settings: Settings,
     repository: Option<Arc<DownloadRepository>>,
+    resolver: Option<Arc<PinningResolver>>,
     events: Option<mpsc::UnboundedSender<EngineEvent>>,
     cancel: CancellationToken,
     pause: Arc<AtomicBool>,
@@ -190,11 +192,15 @@ impl DownloadWorker {
     /// `record.destination_path` must be a full, already-sanitised path; the
     /// caller owns path-traversal defence. `policy` overrides the settings
     /// derived policy (tests and callers that want explicit delays).
+    ///
+    /// `resolver` pins this worker's connections to validator-approved
+    /// addresses (see [`super::resolver`]); `None` keeps the system resolver.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         record: DownloadRecord,
         settings: Settings,
         repository: Option<Arc<DownloadRepository>>,
+        resolver: Option<Arc<PinningResolver>>,
         events: Option<mpsc::UnboundedSender<EngineEvent>>,
         cancel: CancellationToken,
         pause: Arc<AtomicBool>,
@@ -208,6 +214,7 @@ impl DownloadWorker {
             record,
             settings,
             repository,
+            resolver,
             events,
             cancel,
             pause,
@@ -332,6 +339,7 @@ impl DownloadWorker {
             true,
         )
         .map_err(EngineError::UnsafeUrl)?;
+        self.pin_validated(&validated);
         self.current_url = validated.url;
 
         if self.record.destination_path.trim().is_empty() {
@@ -444,6 +452,7 @@ impl DownloadWorker {
                     self.settings.allow_private_addresses,
                 ) {
                     Ok(validated) => {
+                        self.pin_validated(&validated);
                         current = validated.url;
                         self.current_url = current.clone();
                         continue;
@@ -503,11 +512,25 @@ impl DownloadWorker {
         if let Some(client) = &self.client {
             return Ok(client.clone());
         }
-        let client = build_client(&self.settings).map_err(|error| {
+        let resolver: Option<Arc<dyn reqwest::dns::Resolve>> = self
+            .resolver
+            .as_ref()
+            .map(|resolver| Arc::clone(resolver) as Arc<dyn reqwest::dns::Resolve>);
+        let client = build_client_with_resolver(&self.settings, resolver).map_err(|error| {
             EngineError::Failed(format!("could not build HTTP client: {error}"))
         })?;
         self.client = Some(client.clone());
         Ok(client)
+    }
+
+    /// Pin the host to the addresses the validator approved.
+    ///
+    /// Called for the initial URL and after every redirect hop, so the
+    /// connection can only dial an address this process screened itself.
+    fn pin_validated(&self, validated: &validation::ValidatedUrl) {
+        if let Some(resolver) = &self.resolver {
+            resolver.pin(&validated.host, &validated.resolved_ips);
+        }
     }
 
     fn if_range_validator(&self) -> Option<&str> {

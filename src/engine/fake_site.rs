@@ -22,7 +22,14 @@
 //! | `/slow` | 100 bytes in ten 10-byte chunks, 50 ms apart |
 //! | `/html-as-file` | 200 `text/html` landing page |
 //! | `/mismatch` | `Content-Length` larger than the body actually sent |
+//! | `/page` | HTML page linking to files, pages and fragments |
+//! | `/robots.txt` | configurable robots file (404 by default) |
+//! | `/huge` | serves the file named `huge` (set by the test) |
+//! | `/stall` | sleeps 2 s then responds 200 |
 //! | anything else | 404 |
+//!
+//! `HEAD` requests are answered headers-only (with the full `Content-Length`)
+//! and count towards [`FakeSite::hits`] alongside `GET`.
 
 use std::collections::HashMap;
 use std::io;
@@ -39,6 +46,7 @@ pub struct FakeSite {
     addr: SocketAddr,
     files: Mutex<HashMap<String, Vec<u8>>>,
     etags: Mutex<HashMap<String, String>>,
+    robots: Mutex<Option<String>>,
     hits: Mutex<HashMap<String, usize>>,
     inflight: AtomicUsize,
     max_inflight: AtomicUsize,
@@ -55,6 +63,7 @@ impl FakeSite {
             addr,
             files: Mutex::new(HashMap::new()),
             etags: Mutex::new(HashMap::new()),
+            robots: Mutex::new(None),
             hits: Mutex::new(HashMap::new()),
             inflight: AtomicUsize::new(0),
             max_inflight: AtomicUsize::new(1),
@@ -114,6 +123,11 @@ impl FakeSite {
         lock(&self.etags).insert(name.to_string(), etag.to_string());
     }
 
+    /// Serve `content` at `/robots.txt` (default is a 404).
+    pub fn set_robots(&self, content: &str) {
+        *lock(&self.robots) = Some(content.to_string());
+    }
+
     /// Requests seen for `path` (query string ignored).
     pub fn hits(&self, path: &str) -> usize {
         let key = normalise_path(path);
@@ -159,6 +173,7 @@ fn normalise_path(path: &str) -> String {
 
 /// Parsed request head.
 struct Request {
+    method: String,
     path: String,
     headers: HashMap<String, String>,
 }
@@ -166,6 +181,10 @@ struct Request {
 impl Request {
     fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name).map(String::as_str)
+    }
+
+    fn is_head(&self) -> bool {
+        self.method.eq_ignore_ascii_case("HEAD")
     }
 }
 
@@ -209,12 +228,6 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Option<Request>> {
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or("/");
-    if method != "GET" {
-        return Ok(Some(Request {
-            path: normalise_path(target),
-            headers: HashMap::new(),
-        }));
-    }
     let mut headers = HashMap::new();
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
@@ -222,6 +235,7 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Option<Request>> {
         }
     }
     Ok(Some(Request {
+        method: method.to_string(),
         path: normalise_path(target),
         headers,
     }))
@@ -309,6 +323,40 @@ async fn route(site: &Arc<FakeSite>, stream: &mut TcpStream, request: &Request) 
         )
         .await;
     }
+    if path == "/page" {
+        return serve_page(site, stream).await;
+    }
+    if path == "/robots.txt" {
+        let body = lock(&site.robots).clone();
+        return match body {
+            Some(content) => {
+                write_response(
+                    stream,
+                    200,
+                    "OK",
+                    &[("Content-Type", "text/plain; charset=utf-8".to_string())],
+                    content.as_bytes(),
+                )
+                .await
+            }
+            None => {
+                write_response(
+                    stream,
+                    404,
+                    "Not Found",
+                    &[("Content-Type", "text/plain".to_string())],
+                    b"no robots.txt",
+                )
+                .await
+            }
+        };
+    }
+    if path == "/huge" {
+        return serve_file(site, stream, request, "huge", false, false).await;
+    }
+    if path == "/stall" {
+        return serve_stall(stream).await;
+    }
     if path == "/slow" {
         return serve_slow(stream).await;
     }
@@ -370,19 +418,35 @@ async fn serve_file(
         lock(&site.etags).get(&name).cloned()
     };
 
+    if request.is_head() {
+        let mut headers = vec![("Content-Type", content_type_for(&name).to_string())];
+        if ranges {
+            headers.push(("Accept-Ranges", "bytes".to_string()));
+        }
+        if let Some(etag) = &etag {
+            headers.push(("ETag", etag.clone()));
+        }
+        return write_head_response(stream, 200, "OK", &headers, body.len() as u64).await;
+    }
+
+    let content_type = content_type_for(&name);
+
     if let (Some(stored), Some(if_range)) = (&etag, request.header("if-range"))
         && trim_quotes(if_range) != trim_quotes(stored)
     {
-        return write_file_response(stream, 200, &body, ranges, etag.as_deref()).await;
+        return write_file_response(stream, 200, &body, content_type, ranges, etag.as_deref())
+            .await;
     }
 
     if !ranges {
-        return write_file_response(stream, 200, &body, false, etag.as_deref()).await;
+        return write_file_response(stream, 200, &body, content_type, false, etag.as_deref()).await;
     }
 
     let total = body.len() as u64;
     match parse_range(request.header("range"), total) {
-        RangeRequest::Full => write_file_response(stream, 200, &body, true, etag.as_deref()).await,
+        RangeRequest::Full => {
+            write_file_response(stream, 200, &body, content_type, true, etag.as_deref()).await
+        }
         RangeRequest::Unsatisfiable => {
             let mut headers = vec![("Content-Range", format!("bytes */{total}"))];
             if let Some(etag) = &etag {
@@ -408,10 +472,11 @@ async fn write_file_response(
     stream: &mut TcpStream,
     status: u16,
     body: &[u8],
+    content_type: &str,
     accept_ranges: bool,
     etag: Option<&str>,
 ) -> io::Result<()> {
-    let mut headers = vec![("Content-Type", "application/octet-stream".to_string())];
+    let mut headers = vec![("Content-Type", content_type.to_string())];
     if accept_ranges {
         headers.push(("Accept-Ranges", "bytes".to_string()));
     }
@@ -424,6 +489,80 @@ async fn write_file_response(
         "OK"
     };
     write_response(stream, status, reason, &headers, body).await
+}
+
+/// Content type inferred from a fixture filename (enough for HEAD tests).
+fn content_type_for(name: &str) -> &'static str {
+    match name
+        .rsplit('.')
+        .next()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("zip") => "application/zip",
+        Some("pdf") => "application/pdf",
+        Some("png") => "image/png",
+        Some("bin") => "application/octet-stream",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn serve_page(site: &Arc<FakeSite>, stream: &mut TcpStream) -> io::Result<()> {
+    let port = site.addr.port();
+    let page = format!(
+        concat!(
+            "<!doctype html><html><head><title>fixture page</title></head><body>",
+            "<a href=\"/files/data.bin\">data (relative)</a>",
+            "<a href=\"/files/data.bin\">data (relative again)</a>",
+            "<a href=\"http://127.0.0.1:{port}/files/data.bin\">data (absolute)</a>",
+            "<a href=\"#intro\">intro fragment</a>",
+            "<a href=\"/page#top\">top of this page</a>",
+            "<a href=\"/about\">about</a>",
+            "<a href=\"/downloads/report.zip\">report</a>",
+            "<a href=\"/docs/manual.pdf\">manual</a>",
+            "<a href=\"/img/photo.png\">photo</a>",
+            "<a href=\"/files/big.zip\">big</a>",
+            "</body></html>"
+        ),
+        port = port
+    );
+    write_response(
+        stream,
+        200,
+        "OK",
+        &[("Content-Type", "text/html; charset=utf-8".to_string())],
+        page.as_bytes(),
+    )
+    .await
+}
+
+async fn serve_stall(stream: &mut TcpStream) -> io::Result<()> {
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    write_response(
+        stream,
+        200,
+        "OK",
+        &[("Content-Type", "text/plain".to_string())],
+        b"finally",
+    )
+    .await
+}
+
+async fn write_head_response(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    headers: &[(&str, String)],
+    content_length: u64,
+) -> io::Result<()> {
+    let mut head = format!("HTTP/1.1 {status} {reason}\r\n");
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str(&format!(
+        "Content-Length: {content_length}\r\nConnection: close\r\n\r\n"
+    ));
+    write_raw(stream, head.as_bytes(), b"").await
 }
 
 async fn serve_chunked(site: &Arc<FakeSite>, stream: &mut TcpStream, name: &str) -> io::Result<()> {

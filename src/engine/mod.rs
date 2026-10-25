@@ -4,6 +4,7 @@
 //!
 //! - [`retry`] — deterministic exponential backoff and `Retry-After` parsing,
 //! - [`client`] — the shared `reqwest` client (redirects handled manually),
+//! - [`resolver`] — DNS pinning so connections only dial validated addresses,
 //! - [`progress`] — progress snapshots emitted to the UI,
 //! - [`worker`] — one download from `Connecting` to a settled state,
 //! - [`manager`] — queue scheduling, cancellation and pause/resume control.
@@ -16,6 +17,7 @@ pub mod client;
 pub mod fake_site;
 pub mod manager;
 pub mod progress;
+pub mod resolver;
 pub mod retry;
 #[cfg(test)]
 mod tests;

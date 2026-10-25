@@ -985,3 +985,168 @@ fn hex_sha256(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
+
+/// Wait until the scheduler owns no slots (workers finish their bookkeeping
+/// just after they persist a terminal state).
+async fn wait_scheduler_empty(manager: &DownloadManager, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while manager.scheduler_running_count() > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "scheduler still holds {:?}",
+            manager.scheduler_pending()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+// 34
+#[tokio::test]
+async fn repeated_start_all_is_idempotent() {
+    let site = FakeSite::spawn().await;
+    let harness = harness("idempotent", settings_for(&temp_dir("idempotent-settings")));
+    let record = harness
+        .manager
+        .add_download(&site.url("/slow"), None, Some(&harness.dir), None)
+        .expect("add download");
+    let id = record.id.expect("id");
+
+    assert_eq!(harness.manager.start_all(), 1, "first call starts the row");
+    assert_eq!(
+        harness.manager.start_all(),
+        0,
+        "a row already owned by a worker must not be started twice"
+    );
+    assert_eq!(harness.manager.scheduler_pending(), vec![id]);
+
+    let done = wait_terminal(&harness.repository, id, Duration::from_secs(30)).await;
+    assert_eq!(done.state, DownloadState::Completed);
+    wait_scheduler_empty(&harness.manager, Duration::from_secs(10)).await;
+    assert!(harness.manager.scheduler_pending().is_empty());
+    assert_eq!(site.hits("/slow"), 1, "the worker must run exactly once");
+}
+
+// 35
+#[tokio::test]
+async fn cancel_while_queued_never_starts_the_worker() {
+    let site = FakeSite::spawn().await;
+    let mut settings = settings_for(&temp_dir("cancel-queued-settings"));
+    settings.max_simultaneous = 1;
+    let harness = harness("cancel-queued", settings);
+
+    let running = harness
+        .manager
+        .add_download(&site.url("/slow"), None, Some(&harness.dir), None)
+        .expect("add running download");
+    let running_id = running.id.expect("id");
+    let queued = harness
+        .manager
+        .add_download(&site.url("/files/data.bin"), None, Some(&harness.dir), None)
+        .expect("add queued download");
+    let queued_id = queued.id.expect("id");
+
+    assert_eq!(harness.manager.start_all(), 1);
+    assert_eq!(harness.manager.scheduler_pending(), vec![running_id]);
+
+    harness
+        .manager
+        .cancel(queued_id)
+        .expect("cancel queued row");
+    assert_eq!(
+        harness.record(queued_id).state,
+        DownloadState::Cancelled,
+        "a queued row cancels immediately"
+    );
+
+    let done = wait_terminal(&harness.repository, running_id, Duration::from_secs(30)).await;
+    assert_eq!(done.state, DownloadState::Completed);
+    wait_scheduler_empty(&harness.manager, Duration::from_secs(10)).await;
+    assert_eq!(
+        site.hits("/files/data.bin"),
+        0,
+        "the cancelled row must never be fetched"
+    );
+    assert_eq!(
+        harness.record(queued_id).state,
+        DownloadState::Cancelled,
+        "the freed slot must not resurrect a cancelled row"
+    );
+}
+
+// 36
+#[tokio::test]
+async fn retried_row_waits_for_a_free_slot_then_completes() {
+    let site = FakeSite::spawn().await;
+    let mut settings = settings_for(&temp_dir("requeue-settings"));
+    settings.max_simultaneous = 1;
+    let harness = harness("requeue", settings);
+
+    let failing = harness
+        .manager
+        .add_download(
+            &site.url("/files/later.bin"),
+            None,
+            Some(&harness.dir),
+            None,
+        )
+        .expect("add download");
+    let failing_id = failing.id.expect("id");
+    let failed = run_to_terminal(&harness, failing_id).await;
+    assert_eq!(failed.state, DownloadState::Failed);
+
+    // Occupy the only slot, then requeue the failed row.
+    let running = harness
+        .manager
+        .add_download(&site.url("/slow"), None, Some(&harness.dir), None)
+        .expect("add running download");
+    let running_id = running.id.expect("id");
+    assert_eq!(harness.manager.start_all(), 1);
+
+    site.set_file("later.bin", b"late arrival");
+    harness.manager.retry(failing_id).expect("retry");
+    assert_eq!(
+        harness.record(failing_id).state,
+        DownloadState::Queued,
+        "no slot is free, so the retried row must stay queued"
+    );
+    assert_eq!(harness.manager.scheduler_pending(), vec![running_id]);
+
+    let first = wait_terminal(&harness.repository, running_id, Duration::from_secs(30)).await;
+    assert_eq!(first.state, DownloadState::Completed);
+
+    let done = wait_terminal(&harness.repository, failing_id, Duration::from_secs(30)).await;
+    assert_eq!(done.state, DownloadState::Completed);
+    assert!(done.error_summary.is_none());
+    wait_scheduler_empty(&harness.manager, Duration::from_secs(10)).await;
+    assert_eq!(site.hits("/files/later.bin"), 2, "one failure, one success");
+}
+
+// 37
+#[tokio::test]
+async fn concurrent_completions_leave_no_pending_slots() {
+    let site = FakeSite::spawn().await;
+    let harness = harness("concurrent", settings_for(&temp_dir("concurrent-settings")));
+    let mut ids = Vec::new();
+    for index in 0..3 {
+        let dir = harness.dir.join(format!("slot{index}"));
+        std::fs::create_dir_all(&dir).expect("slot dir");
+        let record = harness
+            .manager
+            .add_download(&site.url("/slow"), None, Some(&dir), None)
+            .expect("add download");
+        ids.push(record.id.expect("id"));
+    }
+
+    assert_eq!(harness.manager.start_all(), 3);
+    for id in &ids {
+        let done = wait_terminal(&harness.repository, *id, Duration::from_secs(30)).await;
+        assert_eq!(done.state, DownloadState::Completed);
+    }
+
+    wait_scheduler_empty(&harness.manager, Duration::from_secs(10)).await;
+    assert!(harness.manager.scheduler_pending().is_empty());
+    for id in &ids {
+        assert_eq!(harness.record(*id).state, DownloadState::Completed);
+    }
+    assert_eq!(site.hits("/slow"), 3);
+}

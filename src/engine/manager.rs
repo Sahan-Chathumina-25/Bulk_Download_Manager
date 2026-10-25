@@ -27,6 +27,7 @@ use crate::models::download_item::DownloadRecord;
 use crate::models::download_status::DownloadState;
 use crate::services::file_naming;
 
+use super::resolver::PinningResolver;
 use super::worker::{DownloadWorker, EngineEvent};
 
 /// Hard upper bound for concurrent downloads (mirrors the settings clamp).
@@ -121,13 +122,24 @@ impl ManagerInner {
                     return;
                 }
             };
-            let Some(record) = queued.into_iter().next() else {
+            let Some(record) = queued.into_iter().find(|record| self.is_startable(record)) else {
                 return;
             };
             if !self.start_record(record) {
                 return;
             }
         }
+    }
+
+    /// True when `record` has an id and no worker of ours already owns it.
+    ///
+    /// A row can still read as `Queued` in the database after a worker claimed
+    /// its slot (the worker only writes `Connecting` once it starts), so the
+    /// scheduler — not the row state — decides whether it may be started.
+    fn is_startable(&self, record: &DownloadRecord) -> bool {
+        record
+            .id
+            .is_some_and(|download_id| !self.scheduler.is_running(download_id))
     }
 
     /// Spawn one worker. Returns `false` when no slot is available.
@@ -155,6 +167,9 @@ impl ManagerInner {
             record,
             self.settings.clone(),
             Some(Arc::clone(&self.repository)),
+            Some(Arc::new(PinningResolver::new(
+                self.settings.allow_private_addresses,
+            ))),
             Some(self.events.clone()),
             cancel,
             pause,
@@ -310,6 +325,9 @@ impl DownloadManager {
             if self.inner.scheduler.running_count() >= self.max_simultaneous() {
                 break;
             }
+            if !self.inner.is_startable(&record) {
+                continue;
+            }
             if self.inner.start_record(record) {
                 started += 1;
             } else {
@@ -317,6 +335,19 @@ impl DownloadManager {
             }
         }
         started
+    }
+
+    /// Ids the scheduler currently owns (ascending). Test-only view of the
+    /// concurrency gate so tests can assert no duplicate workers exist.
+    #[cfg(test)]
+    pub fn scheduler_pending(&self) -> Vec<i64> {
+        self.inner.scheduler.pending()
+    }
+
+    /// Number of scheduler slots currently occupied. Test-only.
+    #[cfg(test)]
+    pub fn scheduler_running_count(&self) -> usize {
+        self.inner.scheduler.running_count()
     }
 
     /// Ask a running worker to pause, or park a queued row.
