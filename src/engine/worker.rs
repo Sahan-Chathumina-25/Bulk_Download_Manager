@@ -88,6 +88,27 @@ const AUTH_BLOCKED_HTML_MESSAGE: &str = "the server refused automated access (HT
 const AUTH_BLOCKED_MESSAGE: &str = "the server refused access (HTTP 403); the resource may require \
      credentials the app does not provide";
 
+/// A Cloudflare/bot-verification challenge page (managed challenge, DDoS-Guard,
+/// ...) served instead of the file. Such pages arrive with 200, 403 or 503, so
+/// the message must not name a status. The app cannot complete an interactive
+/// challenge: say so plainly and point the user at a browser, never imply the
+/// download can bypass the check.
+const BROWSER_CHALLENGE_MESSAGE: &str = "the site requires browser verification — automated \
+     download is not possible; open the link in a browser and, if it offers a direct file link, \
+     copy that into Add Downloads";
+
+/// Upper bound on the response prefix inspected for a challenge page.
+const CHALLENGE_SNIFF_LIMIT: usize = 8 * 1024;
+
+/// Body markers specific enough to identify an interactive verification page.
+const CHALLENGE_BODY_MARKERS: [&str; 5] = [
+    "challenge-platform",
+    "challenges.cloudflare.com",
+    "cf-chl",
+    "cf-browser-verification",
+    "ddos-guard",
+];
+
 /// Errors the engine can settle a download with.
 ///
 /// `TransientHttp` and `Network` are retryable; everything else is permanent.
@@ -492,7 +513,7 @@ impl DownloadWorker {
                 }
             }
 
-            let response = match request.send().await {
+            let mut response = match request.send().await {
                 Ok(response) => response,
                 Err(error) => {
                     tracing::warn!(
@@ -528,6 +549,18 @@ impl DownloadWorker {
                         ))
                         .into());
                     }
+                }
+            }
+
+            // A bot-verification challenge can arrive with any status (200,
+            // 403, 503). Non-2xx bodies are never streamed to disk, so a
+            // bounded sniff here is safe and lets the status branches below
+            // stay unchanged for genuine auth/not-found/transient failures.
+            if !(200..300).contains(&status) {
+                let prefix = read_prefix(&mut response).await;
+                if is_browser_challenge(&response, &prefix) {
+                    drop(response);
+                    return Err(challenge_error());
                 }
             }
 
@@ -678,6 +711,10 @@ impl DownloadWorker {
 
         // Refuse an HTML landing/login page before writing any bytes.
         if content_type_is_html(&content_type) {
+            let prefix = read_prefix(&mut response).await;
+            if is_browser_challenge(&response, &prefix) {
+                return Err(challenge_error());
+            }
             return Err(html_error());
         }
 
@@ -735,6 +772,9 @@ impl DownloadWorker {
             if !got_first_chunk {
                 got_first_chunk = true;
                 if resume_offset == 0 && looks_like_html(&chunk) {
+                    if is_browser_challenge(&response, &chunk) {
+                        return Err(challenge_error());
+                    }
                     return Err(html_error());
                 }
             }
@@ -1144,6 +1184,72 @@ fn looks_like_html(chunk: &[u8]) -> bool {
     let head = &head[..head.len().min(1024)];
     let lowered = head.to_ascii_lowercase();
     lowered.starts_with(b"<!doctype html") || lowered.starts_with(b"<html")
+}
+
+/// Read at most [`CHALLENGE_SNIFF_LIMIT`] bytes from a response that is about
+/// to be rejected (a non-2xx response, or one already known to be HTML).
+///
+/// The cap keeps a hostile or endless error body from being buffered without
+/// bound; the bytes are only used to look for challenge-page markers.
+async fn read_prefix(response: &mut Response) -> Vec<u8> {
+    let mut prefix = Vec::new();
+    while prefix.len() < CHALLENGE_SNIFF_LIMIT {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = CHALLENGE_SNIFF_LIMIT - prefix.len();
+                let take = chunk.len().min(remaining);
+                prefix.extend_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    break;
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    prefix
+}
+
+/// True when the response looks like an interactive browser-verification
+/// challenge (Cloudflare managed challenge, DDoS-Guard, ...).
+///
+/// Any one of these signals is sufficient:
+/// - `cf-mitigated: challenge|captcha|block`
+/// - a body marker specific to such pages
+/// - `server: cloudflare` plus the generic "Just a moment" marker
+fn is_browser_challenge(response: &Response, body_prefix: &[u8]) -> bool {
+    if header_text(response, "cf-mitigated").is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "challenge" | "captcha" | "block"
+        )
+    }) {
+        return true;
+    }
+
+    let head = &body_prefix[..body_prefix.len().min(CHALLENGE_SNIFF_LIMIT)];
+    if head.is_empty() {
+        return false;
+    }
+    let lowered = String::from_utf8_lossy(head).to_ascii_lowercase();
+    if CHALLENGE_BODY_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+    {
+        return true;
+    }
+    has_cloudflare_edge(response) && lowered.contains("just a moment")
+}
+
+fn has_cloudflare_edge(response: &Response) -> bool {
+    header_text(response, "Server")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("cloudflare"))
+}
+
+fn challenge_error() -> RunError {
+    EngineError::AuthRequired {
+        message: BROWSER_CHALLENGE_MESSAGE,
+    }
+    .into()
 }
 
 fn normalize_checksum(value: Option<&str>) -> Option<String> {

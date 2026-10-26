@@ -1376,6 +1376,107 @@ async fn auth_failure_persists_auth_required_category() {
 }
 
 #[tokio::test]
+async fn challenge_page_with_503_status_requests_browser_verification() {
+    let site = FakeSite::spawn().await;
+    let harness = harness(
+        "challenge-503",
+        settings_for(&temp_dir("challenge-503-settings")),
+    );
+    let record = harness
+        .manager
+        .add_download(&site.url("/challenge"), None, Some(&harness.dir), None)
+        .expect("add download");
+    let done = run_to_terminal(&harness, record.id.expect("id")).await;
+
+    assert_eq!(done.state, DownloadState::Failed);
+    assert_eq!(category_of(&done), "auth_required");
+    let error = done.error_summary.unwrap_or_default();
+    assert!(
+        error.contains("requires browser verification"),
+        "unexpected summary: {error:?}"
+    );
+    assert!(
+        !error.contains("HTML page"),
+        "a challenge page must not fall back to the generic HTML message: {error:?}"
+    );
+    // A challenge is permanent for the worker: no retry storm.
+    assert_eq!(done.retry_count, 0);
+    assert_eq!(site.hits("/challenge"), 1);
+}
+
+#[tokio::test]
+async fn challenge_page_with_200_status_requests_browser_verification() {
+    let site = FakeSite::spawn().await;
+    let harness = harness(
+        "challenge-200",
+        settings_for(&temp_dir("challenge-200-settings")),
+    );
+    let record = harness
+        .manager
+        .add_download(&site.url("/challenge-200"), None, Some(&harness.dir), None)
+        .expect("add download");
+    let done = run_to_terminal(&harness, record.id.expect("id")).await;
+
+    assert_eq!(done.state, DownloadState::Failed);
+    assert_eq!(category_of(&done), "auth_required");
+    let error = done.error_summary.unwrap_or_default();
+    assert!(
+        error.contains("requires browser verification"),
+        "unexpected summary: {error:?}"
+    );
+    assert!(
+        !error.contains("HTML page"),
+        "a challenge page must not fall back to the generic HTML message: {error:?}"
+    );
+    assert_eq!(done.retry_count, 0);
+    assert_eq!(site.hits("/challenge-200"), 1);
+}
+
+#[tokio::test]
+async fn challenge_page_with_403_status_requests_browser_verification() {
+    let site = FakeSite::spawn().await;
+    let harness = harness(
+        "challenge-403",
+        settings_for(&temp_dir("challenge-403-settings")),
+    );
+    let record = harness
+        .manager
+        .add_download(&site.url("/challenge-403"), None, Some(&harness.dir), None)
+        .expect("add download");
+    let done = run_to_terminal(&harness, record.id.expect("id")).await;
+
+    assert_eq!(done.state, DownloadState::Failed);
+    assert_eq!(category_of(&done), "auth_required");
+    let error = done.error_summary.unwrap_or_default();
+    assert!(
+        error.contains("requires browser verification"),
+        "unexpected summary: {error:?}"
+    );
+    assert_eq!(done.retry_count, 0);
+    assert_eq!(site.hits("/challenge-403"), 1);
+}
+
+#[tokio::test]
+async fn plain_html_page_keeps_generic_html_message() {
+    let site = FakeSite::spawn().await;
+    let harness = harness("plain-html", settings_for(&temp_dir("plain-html-settings")));
+    let record = harness
+        .manager
+        .add_download(&site.url("/html-as-file"), None, Some(&harness.dir), None)
+        .expect("add download");
+    let done = run_to_terminal(&harness, record.id.expect("id")).await;
+
+    assert_eq!(done.state, DownloadState::Failed);
+    assert_eq!(category_of(&done), "html_page");
+    let error = done.error_summary.unwrap_or_default();
+    assert!(error.contains("HTML page"), "unexpected summary: {error:?}");
+    assert!(
+        !error.contains("browser verification"),
+        "plain HTML must not be classified as a challenge: {error:?}"
+    );
+}
+
+#[tokio::test]
 async fn checksum_mismatch_persists_checksum_category() {
     let site = FakeSite::spawn().await;
     let harness = harness(

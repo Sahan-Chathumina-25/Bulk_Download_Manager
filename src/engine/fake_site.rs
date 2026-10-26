@@ -22,6 +22,9 @@
 //! | `/slow` | 100 bytes in ten 10-byte chunks, 50 ms apart |
 //! | `/html-as-file` | 200 `text/html` landing page |
 //! | `/gone-html` | 404 `text/html` page (expired file-locker link) |
+//! | `/challenge` | 503 Cloudflare-style browser challenge page |
+//! | `/challenge-200` | 200 Cloudflare-style browser challenge page |
+//! | `/challenge-403` | 403 Cloudflare-style browser challenge page |
 //! | `/mismatch` | `Content-Length` larger than the body actually sent |
 //! | `/page` | HTML page linking to files, pages and fragments |
 //! | `/robots.txt` | configurable robots file (404 by default) |
@@ -41,6 +44,16 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+/// Body of a Cloudflare-style interactive challenge page. The markers are the
+/// ones the worker looks for: the "Just a moment..." title and the
+/// `challenge-platform` / `challenges.cloudflare.com` script references.
+const CHALLENGE_HTML: &str = concat!(
+    "<!DOCTYPE html><html><head><title>Just a moment...</title>",
+    "<script src=\"https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/v0/api.js\"></script>",
+    "</head><body><h1>Just a moment...</h1>",
+    "<div id=\"cf-chl-widget\"></div></body></html>"
+);
 
 /// One in-process HTTP server shared by a test.
 pub struct FakeSite {
@@ -399,6 +412,30 @@ async fn route(site: &Arc<FakeSite>, stream: &mut TcpStream, request: &Request) 
         )
         .await;
     }
+    if path == "/challenge" {
+        return serve_challenge(
+            stream,
+            503,
+            "Service Unavailable",
+            &[("Server", "cloudflare".to_string())],
+        )
+        .await;
+    }
+    if path == "/challenge-200" {
+        return serve_challenge(stream, 200, "OK", &[("Server", "cloudflare".to_string())]).await;
+    }
+    if path == "/challenge-403" {
+        return serve_challenge(
+            stream,
+            403,
+            "Forbidden",
+            &[
+                ("Server", "cloudflare".to_string()),
+                ("cf-mitigated", "challenge".to_string()),
+            ],
+        )
+        .await;
+    }
     write_response(
         stream,
         404,
@@ -676,6 +713,17 @@ async fn serve_chunked(site: &Arc<FakeSite>, stream: &mut TcpStream, name: &str)
     }
     stream.write_all(b"0\r\n\r\n").await?;
     stream.flush().await
+}
+
+async fn serve_challenge(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    extra_headers: &[(&str, String)],
+) -> io::Result<()> {
+    let mut headers = vec![("Content-Type", "text/html; charset=utf-8".to_string())];
+    headers.extend_from_slice(extra_headers);
+    write_response(stream, status, reason, &headers, CHALLENGE_HTML.as_bytes()).await
 }
 
 async fn serve_status(stream: &mut TcpStream, code: &str) -> io::Result<()> {
