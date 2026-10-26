@@ -68,11 +68,31 @@ fn truncate_preserving_extension(name: &str) -> String {
 }
 
 /// Derive a filename from a URL path (fragment+query stripped, decoded).
+///
+/// Some file lockers put the real filename in the URL fragment, e.g.
+/// `.../vcqpuy297lnc#Show_S01.part021.rar`. Fragments never reach the server,
+/// so when the path's last segment has no known extension and the fragment's
+/// last path-like segment does, the fragment supplies the display name.
 pub fn filename_from_url(url: &str) -> String {
     let path = url_path_segment(url);
     let basename = path.rsplit('/').next().unwrap_or("");
     let decoded = percent_encoding::percent_decode_str(basename).decode_utf8_lossy();
+    if classify_extension(&decoded).is_none()
+        && let Some(from_fragment) = filename_from_fragment(url)
+    {
+        return from_fragment;
+    }
     sanitize_filename(&decoded)
+}
+
+/// Extract a sanitized filename from a URL fragment when its last
+/// path-like segment carries a plausible extension; otherwise None.
+fn filename_from_fragment(url: &str) -> Option<String> {
+    let fragment = url.split_once('#')?.1;
+    let candidate = fragment.rsplit('/').next().unwrap_or("");
+    let decoded = percent_encoding::percent_decode_str(candidate).decode_utf8_lossy();
+    classify_extension(&decoded)?;
+    Some(sanitize_filename(&decoded))
 }
 
 /// Mirror urllib.parse.urlsplit(url).path for the inputs this app accepts:
@@ -352,6 +372,39 @@ mod tests {
         assert_eq!(
             filename_from_url("https://example.com/win/CON.zip"),
             "_CON.zip"
+        );
+    }
+
+    #[test]
+    fn filename_from_url_prefers_fragment_filename_over_extensionless_token() {
+        let url = "https://fuckingfast.co/vcqpuy297lnc#Black_Myth_Wukong_--_fitgirl-repacks.site_--_.part021.rar";
+        assert_eq!(
+            filename_from_url(url),
+            "Black_Myth_Wukong_--_fitgirl-repacks.site_--_.part021.rar"
+        );
+        assert_eq!(
+            filename_from_url("https://example.com/token#dir/nested/archive.tar.gz"),
+            "archive.tar.gz"
+        );
+    }
+
+    #[test]
+    fn filename_from_url_keeps_path_extension_over_fragment() {
+        assert_eq!(
+            filename_from_url("https://example.com/real.zip#decoy.part1.rar"),
+            "real.zip"
+        );
+    }
+
+    #[test]
+    fn filename_from_url_ignores_extensionless_fragment() {
+        assert_eq!(
+            filename_from_url("https://example.com/vcqpuy297lnc#download"),
+            "vcqpuy297lnc"
+        );
+        assert_eq!(
+            filename_from_url("https://example.com/files/page#section"),
+            "page"
         );
     }
 

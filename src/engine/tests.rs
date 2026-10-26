@@ -618,10 +618,9 @@ async fn auth_required_is_not_retried() {
     let done = run_to_terminal(&harness, id).await;
     assert_eq!(done.state, DownloadState::Failed);
     assert_eq!(done.retry_count, 0);
-    assert!(
-        done.error_summary
-            .unwrap_or_default()
-            .contains("authentication")
+    assert_eq!(
+        done.error_summary.unwrap_or_default(),
+        "the server refused access (HTTP 403); the resource may require credentials the app does not provide"
     );
     assert_eq!(site.hits("/status/403"), 1);
 }
@@ -1335,6 +1334,31 @@ async fn missing_file_persists_not_found_category() {
 
     assert_eq!(done.state, DownloadState::Failed);
     assert_eq!(category_of(&done), "not_found");
+}
+
+#[tokio::test]
+async fn missing_file_with_html_body_hints_at_expired_link() {
+    let site = FakeSite::spawn().await;
+    let harness = harness(
+        "diag-404-html",
+        settings_for(&temp_dir("diag-404-html-settings")),
+    );
+    let record = harness
+        .manager
+        .add_download(&site.url("/gone-html"), None, Some(&harness.dir), None)
+        .expect("add download");
+    let done = run_to_terminal(&harness, record.id.expect("id")).await;
+
+    assert_eq!(done.state, DownloadState::Failed);
+    assert_eq!(category_of(&done), "not_found");
+    let error = done.error_summary.unwrap_or_default();
+    assert!(
+        error.contains("may be expired, removed, or require browser interaction"),
+        "unexpected summary: {error:?}"
+    );
+    // A 404/410 is permanent: the worker must not retry the HTML page.
+    assert_eq!(done.retry_count, 0);
+    assert_eq!(site.hits("/gone-html"), 1);
 }
 
 #[tokio::test]

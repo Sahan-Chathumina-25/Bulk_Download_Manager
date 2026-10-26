@@ -21,6 +21,7 @@
 //! | `/redirect-private` | 302 to a link-local metadata address |
 //! | `/slow` | 100 bytes in ten 10-byte chunks, 50 ms apart |
 //! | `/html-as-file` | 200 `text/html` landing page |
+//! | `/gone-html` | 404 `text/html` page (expired file-locker link) |
 //! | `/mismatch` | `Content-Length` larger than the body actually sent |
 //! | `/page` | HTML page linking to files, pages and fragments |
 //! | `/robots.txt` | configurable robots file (404 by default) |
@@ -376,6 +377,16 @@ async fn route(site: &Arc<FakeSite>, stream: &mut TcpStream, request: &Request) 
             "OK",
             &[("Content-Type", "text/html; charset=utf-8".to_string())],
             b"<html><body><h1>this is html, not a zip</h1></body></html>",
+        )
+        .await;
+    }
+    if path == "/gone-html" {
+        return write_response(
+            stream,
+            404,
+            "Not Found",
+            &[("Content-Type", "text/html; charset=utf-8".to_string())],
+            b"<html><body><h1>file removed</h1></body></html>",
         )
         .await;
     }

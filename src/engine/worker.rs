@@ -71,6 +71,23 @@ const REDIRECT_STATUSES: [u16; 5] = [301, 302, 303, 307, 308];
 const HTML_ERROR: &str = "the server returned an HTML page instead of the requested file; \
      the link may be a landing/login page — open it in a browser";
 
+/// Appended to a 404/410 whose body is an HTML page: file lockers answer a
+/// gone/expired link with their landing page, which needs a browser to proceed.
+const NOT_FOUND_HTML_HINT: &str = "; the server responded with an HTML page — the link may be \
+     expired, removed, or require browser interaction";
+
+/// 401: the server demands credentials the app has no way to supply.
+const AUTH_REQUIRED_MESSAGE: &str = "server requires authentication (HTTP 401)";
+
+/// 403 whose body is HTML: bot protection / browser verification. The app has
+/// no credentials or cookies feature, so do not suggest configuring any.
+const AUTH_BLOCKED_HTML_MESSAGE: &str = "the server refused automated access (HTTP 403); the site \
+     requires browser verification — open the link in a browser";
+
+/// 403 with a non-HTML body: the resource may sit behind credentials.
+const AUTH_BLOCKED_MESSAGE: &str = "the server refused access (HTTP 403); the resource may require \
+     credentials the app does not provide";
+
 /// Errors the engine can settle a download with.
 ///
 /// `TransientHttp` and `Network` are retryable; everything else is permanent.
@@ -83,15 +100,15 @@ pub enum EngineError {
         retry_after: Option<f64>,
     },
 
-    /// 401/403: retrying will not help.
-    #[error(
-        "server requires authentication (HTTP {0}); configure credentials/cookies for this source"
-    )]
-    AuthRequired(u16),
+    /// 401/403: retrying will not help. `message` is the complete user-facing
+    /// explanation, without suggesting credentials the app cannot supply.
+    #[error("{message}")]
+    AuthRequired { message: &'static str },
 
-    /// 404/410: the file is gone.
-    #[error("file not found on server (HTTP {0})")]
-    NotFound(u16),
+    /// 404/410: the file is gone. `hint` is empty unless the server answered
+    /// with an HTML page (expired/removed link or a JS-gated locker).
+    #[error("file not found on server (HTTP {status}){hint}")]
+    NotFound { status: u16, hint: &'static str },
 
     /// Any other non-2xx status.
     #[error("unexpected HTTP status {0}")]
@@ -139,8 +156,8 @@ impl EngineError {
             Self::TransientHttp { status, .. } | Self::UnexpectedStatus(status) => {
                 classify_status(*status)
             }
-            Self::AuthRequired(_) => FailureCategory::AuthRequired,
-            Self::NotFound(_) => FailureCategory::NotFound,
+            Self::AuthRequired { .. } => FailureCategory::AuthRequired,
+            Self::NotFound { .. } => FailureCategory::NotFound,
             Self::Network(error) if error.is_timeout() => FailureCategory::Timeout,
             Self::Network(_) => FailureCategory::Network,
             Self::Failed(message) => classify_failure_message(message),
@@ -515,12 +532,27 @@ impl DownloadWorker {
             }
 
             if status == 401 || status == 403 {
+                let html = header_text(&response, "Content-Type")
+                    .as_deref()
+                    .is_some_and(content_type_is_html);
                 drop(response);
-                return Err(EngineError::AuthRequired(status).into());
+                let message = match (status, html) {
+                    (401, _) => AUTH_REQUIRED_MESSAGE,
+                    (_, true) => AUTH_BLOCKED_HTML_MESSAGE,
+                    (_, false) => AUTH_BLOCKED_MESSAGE,
+                };
+                return Err(EngineError::AuthRequired { message }.into());
             }
             if status == 404 || status == 410 {
+                // A file locker whose link expired/vanished often answers with
+                // its HTML landing page; surface that so the user knows a
+                // browser may be required instead of chasing a network issue.
+                let html = header_text(&response, "Content-Type")
+                    .as_deref()
+                    .is_some_and(content_type_is_html);
                 drop(response);
-                return Err(EngineError::NotFound(status).into());
+                let hint = if html { NOT_FOUND_HTML_HINT } else { "" };
+                return Err(EngineError::NotFound { status, hint }.into());
             }
             if status == 416 && resume_offset > 0 {
                 let total = total_from_416(&response);
