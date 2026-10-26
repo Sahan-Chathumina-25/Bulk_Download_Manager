@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::Settings;
+use crate::config::{CollisionPolicy, Settings};
 use crate::database::repository::DownloadRepository;
 use crate::models::download_item::DownloadRecord;
 use crate::models::download_status::DownloadState;
@@ -92,6 +92,9 @@ struct ManagerInner {
     tasks: Mutex<HashMap<i64, JoinHandle<()>>>,
     cancels: Mutex<HashMap<i64, CancellationToken>>,
     pauses: Mutex<HashMap<i64, Arc<AtomicBool>>>,
+    /// Set once `shutdown` starts. Both `pump` and `start_record` consult it so
+    /// a worker finishing during shutdown cannot dispatch queued rows.
+    shutting_down: AtomicBool,
 }
 
 impl ManagerInner {
@@ -113,6 +116,9 @@ impl ManagerInner {
 
     /// Start queued downloads until the concurrency cap is reached.
     fn pump(self: &Arc<Self>) {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
         loop {
             if self.scheduler.running_count() >= self.max_simultaneous() {
                 return;
@@ -146,6 +152,9 @@ impl ManagerInner {
 
     /// Spawn one worker. Returns `false` when no slot is available.
     fn start_record(self: &Arc<Self>, mut record: DownloadRecord) -> bool {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return false;
+        }
         let Some(download_id) = record.id else {
             tracing::warn!("refusing to start a download without a database id");
             return false;
@@ -213,6 +222,7 @@ impl DownloadManager {
             tasks: Mutex::new(HashMap::new()),
             cancels: Mutex::new(HashMap::new()),
             pauses: Mutex::new(HashMap::new()),
+            shutting_down: AtomicBool::new(false),
         });
         Self { inner }
     }
@@ -290,10 +300,58 @@ impl DownloadManager {
             }
         };
 
-        let filename = file_naming::filename_from_url(url);
+        // A user-supplied filename becomes the destination basename (legacy
+        // behaviour), so it must pass through the same sanitiser as every
+        // other name; a blank override falls back to the URL-derived name.
+        let override_name = display_name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(file_naming::sanitize_filename);
+        let filename = override_name
+            .clone()
+            .unwrap_or_else(|| file_naming::filename_from_url(url));
         let destination = file_naming::resolve_destination(&directory, &filename);
-        let Some(resolved) = file_naming::unique_path(&destination, settings.filename_collision)
-        else {
+
+        // A destination owned by a row that has not settled (or a `.part`
+        // already on disk) is just as occupied as a finished file: two
+        // workers writing one `.part` would corrupt both downloads.
+        let in_flight: HashSet<PathBuf> = self
+            .inner
+            .repository
+            .list_all()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|record| !record.state.is_terminal())
+            .filter_map(|record| {
+                let path = record.destination_path.trim();
+                (!path.is_empty()).then(|| PathBuf::from(path))
+            })
+            .collect();
+
+        let in_flight_conflict = in_flight.contains(&destination);
+        if in_flight_conflict && matches!(settings.filename_collision, CollisionPolicy::Skip) {
+            let name = destination
+                .file_name()
+                .map(|value| value.to_string_lossy().into_owned())
+                .unwrap_or(filename);
+            return Err(format!(
+                "destination {name:?} is already being downloaded and the collision policy \
+                 is 'skip'; choose another filename or policy"
+            ));
+        }
+        // In-flight rows are never shareable, so a clash always picks a free
+        // variant even when the policy would otherwise keep the name
+        // (keep_existing/overwrite only speak about finished files).
+        let policy = if in_flight_conflict {
+            CollisionPolicy::Rename
+        } else {
+            settings.filename_collision
+        };
+        let Some(resolved) = file_naming::unique_path_with(&destination, policy, |candidate| {
+            candidate.exists()
+                || file_naming::part_path(candidate).exists()
+                || in_flight.contains(candidate)
+        }) else {
             let name = destination
                 .file_name()
                 .map(|value| value.to_string_lossy().into_owned())
@@ -304,10 +362,7 @@ impl DownloadManager {
             ));
         };
 
-        let name = display_name
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
+        let name = override_name
             .or_else(|| {
                 resolved
                     .file_name()
@@ -475,21 +530,45 @@ impl DownloadManager {
     }
 
     /// Delete a row; refuses while a worker is still running.
+    ///
+    /// After the row is gone the destination's `.part` sibling is removed
+    /// best-effort so a discarded attempt cannot collide with a later add.
     pub fn remove(&self, download_id: i64) -> Result<bool, String> {
-        self.load(download_id)?;
+        let record = self.load(download_id)?;
         if self.inner.scheduler.is_running(download_id) {
             return Err(format!(
                 "download {download_id} is actively downloading; cancel it before removing"
             ));
         }
-        self.inner
+        let removed = self
+            .inner
             .repository
             .delete(download_id)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if removed && !record.destination_path.trim().is_empty() {
+            let part = file_naming::part_path(Path::new(&record.destination_path));
+            match std::fs::remove_file(&part) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(
+                        download = download_id,
+                        path = %part.display(),
+                        error = %error,
+                        "could not delete the .part file for a removed download"
+                    );
+                }
+            }
+        }
+        Ok(removed)
     }
 
     /// Cancel everything and wait for all workers to settle.
+    ///
+    /// The flag is set *before* cancelling so workers finishing during the
+    /// drain cannot start queued rows; shutdown is terminal for this manager.
     pub async fn shutdown(&self) {
+        self.inner.shutting_down.store(true, Ordering::SeqCst);
         let tokens: Vec<CancellationToken> = lock(&self.inner.cancels).values().cloned().collect();
         for token in tokens {
             token.cancel();

@@ -26,6 +26,9 @@
 //! | `/challenge-200` | 200 Cloudflare-style browser challenge page |
 //! | `/challenge-403` | 403 Cloudflare-style browser challenge page |
 //! | `/mismatch` | `Content-Length` larger than the body actually sent |
+//! | `/drop-half/<name>` | first request sends half the body and drops |
+//! | `/comment-html` | 200 octet-stream HTML body starting with a comment |
+//! | `/split-html` | 200 octet-stream HTML body split across chunks |
 //! | `/page` | HTML page linking to files, pages and fragments |
 //! | `/robots.txt` | configurable robots file (404 by default) |
 //! | `/huge` | serves the file named `huge` (set by the test) |
@@ -274,6 +277,14 @@ async fn route(site: &Arc<FakeSite>, stream: &mut TcpStream, request: &Request) 
     if let Some(name) = path.strip_prefix("/chunked/") {
         return serve_chunked(site, stream, name).await;
     }
+    if let Some(name) = path.strip_prefix("/drop-half/") {
+        // The hit counter already includes this request: the first attempt
+        // gets a truncated body, later attempts (a resume) get the full file.
+        if site.hits(path) == 1 {
+            return serve_dropped_body(site, stream, name).await;
+        }
+        return serve_file(site, stream, request, name, true, false).await;
+    }
     if let Some(name) = path.strip_prefix("/flaky/") {
         // The hit counter already includes this request: fail the first two
         // attempts so a retrying worker succeeds on the third.
@@ -392,6 +403,19 @@ async fn route(site: &Arc<FakeSite>, stream: &mut TcpStream, request: &Request) 
             b"<html><body><h1>this is html, not a zip</h1></body></html>",
         )
         .await;
+    }
+    if path == "/comment-html" {
+        return write_response(
+            stream,
+            200,
+            "OK",
+            &[("Content-Type", "application/octet-stream".to_string())],
+            b"<!-- comment -->\n<html><body>not a file</body></html>",
+        )
+        .await;
+    }
+    if path == "/split-html" {
+        return serve_split_html(stream).await;
     }
     if path == "/gone-html" {
         return write_response(
@@ -754,6 +778,48 @@ async fn serve_slow(stream: &mut TcpStream) -> io::Result<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Ok(())
+}
+
+/// Send an HTML body whose marker is split across two TCP writes, so the
+/// worker's rolling sniff has to accumulate more than one chunk.
+async fn serve_split_html(stream: &mut TcpStream) -> io::Result<()> {
+    let body = b"<html><body>split across chunks</body></html>";
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    write_raw(stream, head.as_bytes(), b"<h").await?;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    stream.write_all(&body[2..]).await?;
+    stream.flush().await
+}
+
+/// Serve `name`'s first half only, with a full `Content-Length`, then drop the
+/// connection: the client sees a truncated message body mid-transfer.
+async fn serve_dropped_body(
+    site: &Arc<FakeSite>,
+    stream: &mut TcpStream,
+    name: &str,
+) -> io::Result<()> {
+    let name = percent_encoding::percent_decode_str(name)
+        .decode_utf8_lossy()
+        .into_owned();
+    let Some(body) = site.file_bytes(&name) else {
+        return write_response(
+            stream,
+            404,
+            "Not Found",
+            &[("Content-Type", "text/plain".to_string())],
+            b"no such file",
+        )
+        .await;
+    };
+    let half = body.len() / 2;
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    write_raw(stream, head.as_bytes(), &body[..half]).await
 }
 
 async fn write_response(

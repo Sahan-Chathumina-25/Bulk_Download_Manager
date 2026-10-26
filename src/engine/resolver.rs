@@ -179,6 +179,15 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_mapped_loopback_pins_are_screened_as_private() {
+        let blocked = PinningResolver::new(false);
+        let mapped = IpAddr::V6("::ffff:127.0.0.1".parse().expect("valid IPv6"));
+        blocked.pin("mapped.example", &[mapped]);
+        let error = collect(blocked.resolve(name("mapped.example"))).expect_err("must refuse");
+        assert!(error.contains("screening"), "unexpected error: {error}");
+    }
+
+    #[test]
     fn normalisation_handles_brackets_case_and_whitespace() {
         assert_eq!(normalize_host(" [FILES.Example] "), "files.example");
         assert_eq!(normalize_host("[::1]"), "::1");

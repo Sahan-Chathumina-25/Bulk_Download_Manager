@@ -84,21 +84,54 @@ const SECRET_PARAM_NAMES: [&str; 47] = [
 
 /// True if the address falls into any blocked IPv4 range.
 ///
-/// Mirrors 0.0.0.0/8, 10/8, 127/8, 169.254/16, 172.16/12, 192.168/16.
+/// Covers the private/loopback/link-local ranges plus the reserved,
+/// documentation, shared (CGNAT), benchmarking, multicast and
+/// future-use/broadcast ranges that must never be dialed either.
 fn is_private_v4(ip: &Ipv4Addr) -> bool {
     let o = ip.octets();
-    o[0] == 0
-        || o[0] == 10
-        || o[0] == 127
-        || (o[0] == 169 && o[1] == 254)
-        || (o[0] == 172 && (16..=31).contains(&o[1]))
-        || (o[0] == 192 && o[1] == 168)
+    o[0] == 0                                          // 0.0.0.0/8
+        || o[0] == 10                                  // 10.0.0.0/8
+        || o[0] == 127                                 // 127.0.0.0/8
+        || (o[0] == 169 && o[1] == 254)                 // 169.254.0.0/16
+        || (o[0] == 172 && (16..=31).contains(&o[1]))  // 172.16.0.0/12
+        || (o[0] == 192 && o[1] == 168)                 // 192.168.0.0/16
+        || (o[0] == 100 && (64..=127).contains(&o[1]))  // 100.64.0.0/10 (CGNAT)
+        || (o[0] == 198 && (o[1] == 18 || o[1] == 19))  // 198.18.0.0/15
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0)      // 192.0.0.0/24
+        || (o[0] == 198 && o[1] == 51 && o[2] == 100)   // 198.51.100.0/24
+        || (o[0] == 203 && o[1] == 0 && o[2] == 113)    // 203.0.113.0/24
+        || (224..=239).contains(&o[0])                  // 224.0.0.0/4 (multicast)
+        || o[0] >= 240 // 240.0.0.0/4, including 255.255.255.255
+}
+
+/// The IPv4 address embedded in an IPv4-mapped (`::ffff:a.b.c.d`) or
+/// deprecated IPv4-compatible (`::a.b.c.d`) IPv6 address.
+fn embedded_v4(ip: &Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let segments = ip.segments();
+    if segments[..6].iter().all(|segment| *segment == 0)
+        && !ip.is_loopback()
+        && !ip.is_unspecified()
+    {
+        let octets = ip.octets();
+        return Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    None
 }
 
 /// True if the address falls into any blocked IPv6 range.
 ///
+/// IPv4-mapped and IPv4-compatible spellings are screened as the IPv4
+/// address they embed, so `[::ffff:127.0.0.1]` cannot bypass the v4 ranges.
 /// Mirrors ::1/128, ::/128, fc00::/7 and fe80::/10.
 fn is_private_v6(ip: &Ipv6Addr) -> bool {
+    if let Some(v4) = embedded_v4(ip) {
+        return is_private_v4(&v4);
+    }
     let segments = ip.segments();
     ip.is_loopback()
         || ip.is_unspecified()
@@ -315,7 +348,8 @@ pub fn validate_redirect(
             .join(location)
             .map_err(|_| {
                 UnsafeUrlError::new(format!(
-                    "redirect target is not an http(s) URL: {location:?}"
+                    "redirect target is not an http(s) URL: {:?}",
+                    redact_url(location)
                 ))
             })?
             .to_string(),
@@ -325,7 +359,8 @@ pub fn validate_redirect(
     let lowered = joined.to_ascii_lowercase();
     if !lowered.starts_with("http://") && !lowered.starts_with("https://") {
         return Err(UnsafeUrlError::new(format!(
-            "redirect target is not an http(s) URL: {location:?}"
+            "redirect target is not an http(s) URL: {:?}",
+            redact_url(location)
         )));
     }
 
@@ -525,6 +560,62 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_mapped_and_compatible_ipv6_are_screened_as_ipv4() {
+        for url in [
+            "http://[::ffff:127.0.0.1]/x",
+            "http://[::ffff:169.254.169.254]/latest/meta-data/",
+            "http://[::ffff:10.1.2.3]/x",
+            "http://[::127.0.0.1]/x",
+            "http://[::a9fe:a9fe]/latest/meta-data/",
+        ] {
+            assert!(
+                validate_url_for_network(url).is_err(),
+                "expected rejection: {url}"
+            );
+        }
+        // A mapped *public* address is not private and stays reachable.
+        assert!(validate_url_for_network("http://[::ffff:8.8.8.8]/x").is_ok());
+    }
+
+    #[test]
+    fn additional_reserved_ipv4_ranges_rejected() {
+        for url in [
+            "http://100.64.0.1/x",
+            "http://100.127.255.254/x",
+            "http://198.18.0.1/x",
+            "http://198.19.255.254/x",
+            "http://192.0.0.170/x",
+            "http://198.51.100.7/x",
+            "http://203.0.113.9/x",
+            "http://224.0.0.1/x",
+            "http://239.255.255.255/x",
+            "http://240.0.0.1/x",
+            "http://255.255.255.255/x",
+        ] {
+            assert!(
+                validate_url_for_network(url).is_err(),
+                "expected rejection: {url}"
+            );
+        }
+        // Neighbouring public addresses must not be over-blocked.
+        for url in [
+            "http://100.63.255.255/x",
+            "http://100.128.0.0/x",
+            "http://198.17.255.255/x",
+            "http://198.20.0.0/x",
+            "http://192.0.1.1/x",
+            "http://198.51.99.1/x",
+            "http://203.0.112.1/x",
+            "http://223.255.255.255/x",
+        ] {
+            assert!(
+                validate_url_for_network(url).is_ok(),
+                "expected acceptance: {url}"
+            );
+        }
+    }
+
+    #[test]
     fn bad_scheme_and_empty_rejected() {
         for url in [
             "ftp://example.com/file.zip",
@@ -700,6 +791,20 @@ mod tests {
         let err = validate_redirect("https://example.com/start", "javascript:alert(1)", false)
             .unwrap_err();
         assert!(err.to_string().contains("not an http"));
+    }
+
+    #[test]
+    fn validate_redirect_redacts_location_in_errors() {
+        let err = validate_redirect(
+            "http://example.com/start",
+            "ftp://user:p4ssw0rd@evil.example/x?token=supersecret",
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!err.contains("p4ssw0rd"), "error leaked credentials: {err}");
+        assert!(!err.contains("supersecret"), "error leaked a token: {err}");
+        assert!(err.contains("evil.example"), "host kept for context: {err}");
     }
 
     // -- parse_url_lines ----------------------------------------------------

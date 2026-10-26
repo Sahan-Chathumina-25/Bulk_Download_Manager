@@ -17,6 +17,7 @@ use crate::engine::progress::DownloadProgress;
 use crate::engine::worker::EngineEvent;
 use crate::models::download_item::DownloadRecord;
 use crate::models::download_status::DownloadState;
+use crate::services::file_naming;
 
 static TEMP_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -333,7 +334,7 @@ async fn rejects_html_body_sniffed_from_octet_stream() {
 
 // 9
 #[tokio::test]
-async fn rejects_content_length_mismatch() {
+async fn retries_truncated_body_then_fails_with_network_error() {
     let site = FakeSite::spawn().await;
     let harness = harness("mismatch", settings_for(&temp_dir("mismatch-settings")));
     let record = harness
@@ -344,7 +345,8 @@ async fn rejects_content_length_mismatch() {
     let done = run_to_terminal(&harness, id).await;
     assert_eq!(done.state, DownloadState::Failed);
     let error = done.error_summary.unwrap_or_default();
-    assert!(error.contains("mismatch"), "error was {error:?}");
+    assert!(error.contains("network failure"), "error was {error:?}");
+    assert!(done.retry_count > 0, "a truncated body must be retried");
 }
 
 // 10
@@ -1512,4 +1514,407 @@ async fn successful_download_clears_the_failure_category() {
 
     assert_eq!(done.state, DownloadState::Completed);
     assert_eq!(done.failure_category, None);
+}
+
+#[tokio::test]
+async fn loopback_url_persists_private_address_category() {
+    let site = FakeSite::spawn().await;
+    let mut settings = settings_for(&temp_dir("diag-private-settings"));
+    settings.allow_private_addresses = false;
+    let harness = harness("diag-private", settings);
+    let record = harness
+        .manager
+        .add_download(&site.url("/files/data.bin"), None, Some(&harness.dir), None)
+        .expect("add download");
+    let done = run_to_terminal(&harness, record.id.expect("id")).await;
+
+    assert_eq!(done.state, DownloadState::Failed);
+    assert_eq!(category_of(&done), "private_address");
+    let error = done.error_summary.unwrap_or_default();
+    assert!(error.contains("private/loopback"), "error was {error:?}");
+    assert_eq!(site.hits("/files/data.bin"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Release-readiness regressions
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rejects_html_behind_a_leading_comment() {
+    let site = FakeSite::spawn().await;
+    let harness = harness(
+        "html-comment",
+        settings_for(&temp_dir("html-comment-settings")),
+    );
+    let record = harness
+        .manager
+        .add_download(&site.url("/comment-html"), None, Some(&harness.dir), None)
+        .expect("add download");
+    let done = run_to_terminal(&harness, record.id.expect("id")).await;
+
+    assert_eq!(done.state, DownloadState::Failed);
+    assert_eq!(category_of(&done), "html_page");
+    let error = done.error_summary.as_deref().unwrap_or_default();
+    assert!(error.contains("HTML page"), "error was {error:?}");
+    assert!(!harness.final_path(&done).exists());
+}
+
+#[tokio::test]
+async fn rejects_html_marker_split_across_chunks() {
+    let site = FakeSite::spawn().await;
+    let harness = harness("html-split", settings_for(&temp_dir("html-split-settings")));
+    let record = harness
+        .manager
+        .add_download(&site.url("/split-html"), None, Some(&harness.dir), None)
+        .expect("add download");
+    let done = run_to_terminal(&harness, record.id.expect("id")).await;
+
+    assert_eq!(done.state, DownloadState::Failed);
+    let error = done.error_summary.as_deref().unwrap_or_default();
+    assert!(error.contains("HTML page"), "error was {error:?}");
+    assert!(!harness.final_path(&done).exists());
+}
+
+#[tokio::test]
+async fn keeps_binary_body_that_contains_html_later() {
+    let site = FakeSite::spawn().await;
+    let mut body = b"PK\x03\x04".to_vec();
+    body.extend_from_slice(&[0u8; 600]);
+    body.extend_from_slice(b"<html><body>embedded bytes</body></html>");
+    site.set_file("late-html.bin", body.clone());
+    let harness = harness("html-late", settings_for(&temp_dir("html-late-settings")));
+    let record = harness
+        .manager
+        .add_download(
+            &site.url("/files/late-html.bin"),
+            None,
+            Some(&harness.dir),
+            None,
+        )
+        .expect("add download");
+    let done = run_to_terminal(&harness, record.id.expect("id")).await;
+
+    assert_eq!(done.state, DownloadState::Completed);
+    assert_eq!(
+        std::fs::read(harness.final_path(&done)).expect("read file"),
+        body
+    );
+}
+
+#[tokio::test]
+async fn resumes_after_a_mid_body_connection_drop() {
+    let site = FakeSite::spawn().await;
+    let harness = harness("drop-half", settings_for(&temp_dir("drop-half-settings")));
+    let data = site.file_bytes("data.bin").expect("fixture file");
+    let record = harness
+        .manager
+        .add_download(
+            &site.url("/drop-half/data.bin"),
+            None,
+            Some(&harness.dir),
+            None,
+        )
+        .expect("add download");
+    let done = run_to_terminal(&harness, record.id.expect("id")).await;
+
+    assert_eq!(done.state, DownloadState::Completed);
+    assert_eq!(
+        std::fs::read(harness.final_path(&done)).expect("read file"),
+        data
+    );
+    assert_eq!(site.hits("/drop-half/data.bin"), 2, "one drop, one resume");
+    assert!(done.retry_count >= 1);
+}
+
+#[tokio::test]
+async fn network_error_summary_does_not_leak_the_url() {
+    // Reserve an ephemeral port, then release it so the connect is refused
+    // deterministically and no test server answers.
+    let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind probe");
+    let port = probe.local_addr().expect("probe address").port();
+    drop(probe);
+
+    let harness = harness(
+        "diag-redact",
+        settings_for(&temp_dir("diag-redact-settings")),
+    );
+    let url = format!("http://127.0.0.1:{port}/secret-file.bin?token=supersecretvalue");
+    let record = harness
+        .manager
+        .add_download(&url, None, Some(&harness.dir), None)
+        .expect("add download");
+    let done = run_to_terminal(&harness, record.id.expect("id")).await;
+
+    assert_eq!(done.state, DownloadState::Failed);
+    let error = done.error_summary.unwrap_or_default();
+    assert!(error.contains("network failure"), "error was {error:?}");
+    assert!(!error.contains("supersecretvalue"), "leaked token: {error}");
+    assert!(!error.contains("token="), "leaked query: {error}");
+    assert!(!error.contains("/secret-file"), "leaked path: {error}");
+    assert!(!error.contains("for url"), "leaked full URL: {error}");
+}
+
+#[tokio::test]
+async fn pause_during_retry_backoff_parks_as_paused() {
+    let site = FakeSite::spawn().await;
+    let mut settings = settings_for(&temp_dir("pause-backoff-settings"));
+    settings.retry_delay = 1.0;
+    settings.retry_count = 3;
+    let harness = harness("pause-backoff", settings);
+    let record = harness
+        .manager
+        .add_download(&site.url("/flaky/data.bin"), None, Some(&harness.dir), None)
+        .expect("add download");
+    let id = record.id.expect("id");
+    harness.manager.start_all();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while harness.record(id).retry_count == 0 {
+        assert!(Instant::now() < deadline, "no retry was ever scheduled");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    harness.manager.pause(id).expect("pause");
+    let paused = wait_state(
+        &harness.repository,
+        id,
+        DownloadState::Paused,
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(paused.state, DownloadState::Paused);
+
+    harness.manager.resume(id).expect("resume");
+    let done = wait_terminal(&harness.repository, id, Duration::from_secs(30)).await;
+    assert_eq!(done.state, DownloadState::Completed);
+    assert_eq!(
+        std::fs::read(harness.final_path(&done)).expect("read file"),
+        site.file_bytes("data.bin").expect("fixture file")
+    );
+}
+
+#[tokio::test]
+async fn checksum_mismatch_discards_the_part_and_retry_redownloads() {
+    let site = FakeSite::spawn().await;
+    let harness = harness(
+        "checksum-discard",
+        settings_for(&temp_dir("checksum-discard-settings")),
+    );
+    let data = site.file_bytes("data.bin").expect("fixture file");
+    let wrong = "2".repeat(64);
+    let record = harness
+        .manager
+        .add_download(
+            &site.url("/files/data.bin"),
+            None,
+            Some(&harness.dir),
+            Some(&wrong),
+        )
+        .expect("add download");
+    let id = record.id.expect("id");
+    let done = run_to_terminal(&harness, id).await;
+
+    assert_eq!(done.state, DownloadState::Failed);
+    assert!(
+        !harness.dir.join("data.bin.part").exists(),
+        "a poisoned .part must be deleted"
+    );
+
+    // With the correct digest, a retry must start from zero, not resume the
+    // (now deleted) bytes, and must download the whole file again.
+    let correct = hex_sha256(&data);
+    let mut updated = harness.record(id);
+    updated.checksum_sha256 = Some(format!("sha256:{correct}"));
+    harness.repository.update(&updated).expect("fix checksum");
+    harness.manager.retry(id).expect("retry");
+    let done = wait_terminal(&harness.repository, id, Duration::from_secs(20)).await;
+
+    assert_eq!(done.state, DownloadState::Completed);
+    assert!(done.checksum_verified);
+    assert_eq!(
+        std::fs::read(harness.final_path(&done)).expect("read file"),
+        data
+    );
+    assert_eq!(site.hits("/files/data.bin"), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Release-readiness wave 2: destination, resume and lifecycle defects
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn duplicate_adds_get_distinct_destination_paths() {
+    let site = FakeSite::spawn().await;
+    let harness = harness(
+        "duplicate-dest",
+        settings_for(&temp_dir("duplicate-dest-settings")),
+    );
+
+    let first = harness
+        .manager
+        .add_download(&site.url("/files/data.bin"), None, Some(&harness.dir), None)
+        .expect("add first download");
+    let second = harness
+        .manager
+        .add_download(&site.url("/files/data.bin"), None, Some(&harness.dir), None)
+        .expect("add duplicate download");
+
+    assert_ne!(
+        first.destination_path, second.destination_path,
+        "two in-flight downloads must never share a destination"
+    );
+    assert!(
+        second.destination_path.ends_with("data (1).bin"),
+        "duplicate destination was {:?}",
+        second.destination_path
+    );
+
+    let first_id = first.id.expect("id");
+    let second_id = second.id.expect("id");
+    let done_first = run_to_terminal(&harness, first_id).await;
+    let done_second = wait_terminal(&harness.repository, second_id, Duration::from_secs(30)).await;
+    assert_eq!(done_first.state, DownloadState::Completed);
+    assert_eq!(done_second.state, DownloadState::Completed);
+    let expected = site.file_bytes("data.bin").expect("fixture file");
+    assert_eq!(
+        std::fs::read(harness.final_path(&done_first)).expect("read first"),
+        expected
+    );
+    assert_eq!(
+        std::fs::read(harness.final_path(&done_second)).expect("read second"),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn filename_override_controls_destination_basename() {
+    let site = FakeSite::spawn().await;
+    let harness = harness(
+        "override-name",
+        settings_for(&temp_dir("override-name-settings")),
+    );
+
+    let record = harness
+        .manager
+        .add_download(
+            &site.url("/files/data.bin"),
+            Some("Custom/Name.bin"),
+            Some(&harness.dir),
+            None,
+        )
+        .expect("add download");
+    let destination = std::path::PathBuf::from(&record.destination_path);
+    let file_name = destination
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    assert_eq!(
+        file_name, "Custom_Name.bin",
+        "the override must drive the path and pass through the sanitiser"
+    );
+
+    let done = run_to_terminal(&harness, record.id.expect("id")).await;
+    assert_eq!(done.state, DownloadState::Completed);
+    assert_eq!(
+        std::fs::read(&destination).expect("read downloaded file"),
+        site.file_bytes("data.bin").expect("fixture file")
+    );
+}
+
+#[tokio::test]
+async fn skip_policy_is_honoured_when_resuming() {
+    let site = FakeSite::spawn().await;
+    let base = temp_dir("resume-skip-settings");
+    let mut settings = settings_for(&base);
+    settings.filename_collision = CollisionPolicy::Skip;
+    let harness = harness("resume-skip", settings);
+
+    // Add while the destination is still free so add-time skip does not
+    // reject; then simulate a paused attempt plus a final file that appeared.
+    let record = harness
+        .manager
+        .add_download(&site.url("/files/data.bin"), None, Some(&base), None)
+        .expect("add download");
+    let id = record.id.expect("id");
+    let final_path = std::path::PathBuf::from(&record.destination_path);
+    std::fs::write(&final_path, b"existing").expect("seed existing final");
+    let full = site.file_bytes("data.bin").expect("fixture file");
+    let part = file_naming::part_path(&final_path);
+    std::fs::write(&part, &full[..1024]).expect("seed part");
+
+    let done = run_to_terminal(&harness, id).await;
+
+    assert_eq!(done.state, DownloadState::Cancelled);
+    assert_eq!(
+        done.failure_category.as_deref(),
+        Some("collision"),
+        "the skip must be reported as a collision"
+    );
+    assert_eq!(
+        std::fs::read(&final_path).expect("read existing final"),
+        b"existing",
+        "a resumed download must not overwrite under the skip policy"
+    );
+    assert!(!part.exists(), "the declined .part must be cleaned up");
+}
+
+#[tokio::test]
+async fn shutdown_stops_scheduling_queued_rows() {
+    let site = FakeSite::spawn().await;
+    let mut settings = settings_for(&temp_dir("shutdown-settings"));
+    settings.max_simultaneous = 1;
+    settings.connection_timeout = 30.0;
+    let harness = harness("shutdown", settings);
+
+    let running_dir = harness.dir.join("slot0");
+    std::fs::create_dir_all(&running_dir).expect("slot dir");
+    harness
+        .manager
+        .add_download(&site.url("/stall"), None, Some(&running_dir), None)
+        .expect("add running download");
+    let queued_dir = harness.dir.join("slot1");
+    std::fs::create_dir_all(&queued_dir).expect("slot dir");
+    let queued = harness
+        .manager
+        .add_download(&site.url("/stall"), None, Some(&queued_dir), None)
+        .expect("add queued download");
+    let queued_id = queued.id.expect("id");
+
+    assert_eq!(harness.manager.start_all(), 1);
+    harness.manager.shutdown().await;
+
+    assert_eq!(harness.manager.scheduler_running_count(), 0);
+    assert_eq!(harness.record(queued_id).state, DownloadState::Queued);
+    assert_eq!(
+        harness.manager.start_all(),
+        0,
+        "shutdown is terminal; nothing may be dispatched afterwards"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        harness.record(queued_id).state,
+        DownloadState::Queued,
+        "a late slot release must not resurrect queued rows after shutdown"
+    );
+    assert!(harness.manager.scheduler_pending().is_empty());
+}
+
+#[tokio::test]
+async fn remove_deletes_the_part_file() {
+    let site = FakeSite::spawn().await;
+    let harness = harness(
+        "remove-part",
+        settings_for(&temp_dir("remove-part-settings")),
+    );
+
+    let record = harness
+        .manager
+        .add_download(&site.url("/files/data.bin"), None, Some(&harness.dir), None)
+        .expect("add download");
+    let id = record.id.expect("id");
+    let part = file_naming::part_path(std::path::Path::new(&record.destination_path));
+    std::fs::write(&part, b"partial").expect("seed part");
+
+    assert!(harness.manager.remove(id).expect("remove queued download"));
+    assert!(!part.exists(), "remove must clean up the .part sibling");
+    assert!(harness.repository.get(id).expect("read").is_none());
 }

@@ -7,8 +7,9 @@
 //!
 //! Backoff is plain exponential growth **without jitter** (the legacy policy
 //! was deterministic and its tests pin exact delays). A server-provided
-//! ``Retry-After`` value is honoured verbatim and is **not** capped by
-//! `max_delay` (also legacy behaviour).
+//! ``Retry-After`` value is honoured, but the *effective* delay is always
+//! clamped to [`MAX_RETRY_AFTER_SECONDS`] (15 minutes) so a hostile or broken
+//! server cannot park a download for hours.
 //!
 //! # Retry-After parsing
 //!
@@ -22,6 +23,12 @@ use std::time::SystemTime;
 
 /// HTTP statuses worth retrying with backoff.
 pub const TRANSIENT_STATUS_CODES: [u16; 7] = [408, 425, 429, 500, 502, 503, 504];
+
+/// Absolute ceiling (15 minutes) for any single retry delay.
+///
+/// Applies after `Retry-After` is parsed, so a server cannot ask the worker
+/// to sleep for an unbounded time.
+pub const MAX_RETRY_AFTER_SECONDS: f64 = 900.0;
 
 /// HTTP statuses that must never be retried (they produce actionable errors).
 pub const PERMANENT_STATUS_CODES: [u16; 8] = [400, 401, 403, 404, 405, 406, 410, 451];
@@ -74,7 +81,7 @@ impl RetryPolicy {
     ///
     /// `attempt` is zero-based before the first retry. Returns
     /// `(should_retry, delay_seconds)`. An explicit `Retry-After` wins over
-    /// backoff and is returned verbatim (not capped by `max_delay`).
+    /// backoff but is clamped to [`MAX_RETRY_AFTER_SECONDS`].
     pub fn should_retry(&self, outcome: &RetryOutcome, attempt: u32) -> (bool, f64) {
         if attempt >= self.max_retries {
             return (false, 0.0);
@@ -88,7 +95,7 @@ impl RetryPolicy {
                 }
             }
             RetryOutcome::Transient { retry_after } => match retry_after {
-                Some(value) => (true, *value),
+                Some(value) => (true, clamp_retry_after(*value)),
                 None => (true, self.backoff(attempt)),
             },
             RetryOutcome::Network => (true, self.backoff(attempt)),
@@ -100,6 +107,18 @@ impl RetryPolicy {
     fn backoff(&self, attempt: u32) -> f64 {
         let exponent = i32::try_from(attempt).unwrap_or(i32::MAX);
         (self.base_delay * 2f64.powi(exponent)).min(self.max_delay)
+    }
+}
+
+/// Clamp a server-provided delay to `0..=MAX_RETRY_AFTER_SECONDS`.
+///
+/// `Retry-After` is untrusted input; a non-finite value degrades to zero so
+/// the worker never sleeps on NaN.
+fn clamp_retry_after(seconds: f64) -> f64 {
+    if seconds.is_finite() {
+        seconds.clamp(0.0, MAX_RETRY_AFTER_SECONDS)
+    } else {
+        0.0
     }
 }
 
@@ -253,6 +272,31 @@ mod tests {
             ),
             (true, 30.0)
         );
+    }
+
+    #[test]
+    fn retry_after_is_clamped_to_fifteen_minutes() {
+        let policy = policy(3, 1.0, 60.0);
+        assert_eq!(
+            policy.should_retry(
+                &RetryOutcome::Transient {
+                    retry_after: Some(86_400.0)
+                },
+                0
+            ),
+            (true, MAX_RETRY_AFTER_SECONDS)
+        );
+        assert_eq!(
+            policy.should_retry(
+                &RetryOutcome::Transient {
+                    retry_after: Some(MAX_RETRY_AFTER_SECONDS + 1.0)
+                },
+                0
+            ),
+            (true, MAX_RETRY_AFTER_SECONDS)
+        );
+        assert_eq!(clamp_retry_after(f64::INFINITY), 0.0);
+        assert_eq!(clamp_retry_after(-5.0), 0.0);
     }
 
     #[test]

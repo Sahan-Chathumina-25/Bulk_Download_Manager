@@ -52,7 +52,9 @@ use crate::services::{file_naming, validation};
 use super::client::build_client_with_resolver;
 use super::progress::DownloadProgress;
 use super::resolver::PinningResolver;
-use super::retry::{RetryOutcome, RetryPolicy, TRANSIENT_STATUS_CODES, parse_retry_after};
+use super::retry::{
+    MAX_RETRY_AFTER_SECONDS, RetryOutcome, RetryPolicy, TRANSIENT_STATUS_CODES, parse_retry_after,
+};
 
 /// Maximum number of redirect hops (the worker makes at most one more
 /// request than this before declaring a loop).
@@ -166,7 +168,20 @@ impl EngineError {
 
     fn failure_message(&self) -> String {
         match self {
-            Self::TransientHttp { .. } | Self::Network(_) => format!("network failure: {self}"),
+            Self::TransientHttp { .. } | Self::Network(_) => {
+                format!("network failure: {}", self.sanitized_message())
+            }
+            _ => self.to_string(),
+        }
+    }
+
+    /// Display text with any request URL that `reqwest` embeds removed.
+    ///
+    /// Only used for logging and the persisted `error_summary`; the structured
+    /// error keeps the original text for callers that match on it.
+    fn sanitized_message(&self) -> String {
+        match self {
+            Self::Network(error) => sanitize_transport_error(&error.to_string()),
             _ => self.to_string(),
         }
     }
@@ -183,7 +198,7 @@ impl EngineError {
             Self::Network(_) => FailureCategory::Network,
             Self::Failed(message) => classify_failure_message(message),
             Self::UnsafeUrl(error) => {
-                if error.0.contains("private-address screening") {
+                if is_private_address_message(&error.0) {
                     FailureCategory::PrivateAddress
                 } else {
                     FailureCategory::Unknown
@@ -243,6 +258,10 @@ pub struct DownloadWorker {
     current_url: String,
     final_path: PathBuf,
     part_path: PathBuf,
+    /// True when this run continues a non-empty `.part` from an earlier
+    /// attempt (a resume); the publish step re-checks the collision policy
+    /// because the policy was skipped at prepare time.
+    resumed: bool,
     last_emit: Instant,
     /// When this worker started (diagnostics).
     started_at: Instant,
@@ -289,6 +308,7 @@ impl DownloadWorker {
             current_url,
             final_path,
             part_path,
+            resumed: false,
             last_emit: Instant::now() - PROGRESS_INTERVAL - Duration::from_millis(1),
             started_at: Instant::now(),
             diagnostic_status: None,
@@ -375,14 +395,19 @@ impl DownloadWorker {
                 }
                 Err(RunError::FreshRestart) => {
                     // Never append across a gap: truncate on the next open.
+                    // The retry budget is deliberately *not* reset here, so a
+                    // server that keeps dropping mid-body cannot loop forever.
                     resume_offset = 0;
-                    attempt = 0;
                     continue;
                 }
                 Err(RunError::Engine(error)) if error.is_transient() => {
                     if !self.retry_or_fail(&error, &mut attempt).await? {
                         return Err(RunError::Engine(error));
                     }
+                    // Resume from whatever the `.part` now holds, so a
+                    // dropped connection continues instead of re-downloading
+                    // the prefix.
+                    resume_offset = self.part_size().await;
                 }
                 Err(other) => return Err(other),
             }
@@ -402,7 +427,7 @@ impl DownloadWorker {
         }
         tracing::warn!(
             download = ?self.record.id,
-            error = %error,
+            error = %error.sanitized_message(),
             delay = delay,
             attempt = *attempt + 1,
             "transient download error; retrying"
@@ -410,7 +435,9 @@ impl DownloadWorker {
         *attempt += 1;
         self.record.retry_count = *attempt;
         self.persist();
-        self.sleep(delay, false).await?;
+        // Pause-aware: a pause during backoff parks the row as Paused and
+        // keeps the `.part`, exactly like a pause mid-transfer.
+        self.sleep(delay, true).await?;
         Ok(true)
     }
 
@@ -442,6 +469,7 @@ impl DownloadWorker {
         self.final_path = final_path;
 
         let fresh = !self.part_exists().await || self.part_size().await == 0;
+        self.resumed = !fresh;
         if fresh {
             self.apply_collision_policy().await?;
         }
@@ -516,10 +544,13 @@ impl DownloadWorker {
             let mut response = match request.send().await {
                 Ok(response) => response,
                 Err(error) => {
+                    // reqwest's Display embeds the full URL (signed query and
+                    // all), so log only the URL-stripped text.
+                    let message = sanitize_transport_error(&error.to_string());
                     tracing::warn!(
                         download = ?self.record.id,
                         url = %validation::redact_url(&current),
-                        error = %error,
+                        error = %message,
                         "could not open stream"
                     );
                     return Err(EngineError::Network(error).into());
@@ -647,16 +678,10 @@ impl DownloadWorker {
     }
 
     fn if_range_validator(&self) -> Option<&str> {
-        self.record
-            .etag
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .or_else(|| {
-                self.record
-                    .last_modified
-                    .as_deref()
-                    .filter(|value| !value.is_empty())
-            })
+        select_if_range_validator(
+            self.record.etag.as_deref(),
+            self.record.last_modified.as_deref(),
+        )
     }
 
     // -- transfer -------------------------------------------------------------
@@ -746,7 +771,10 @@ impl DownloadWorker {
 
         let mut digest = Sha256::new();
         let mut received: u64 = 0;
-        let mut got_first_chunk = false;
+        // A 200 body is sniffed for HTML using a bounded rolling prefix. The
+        // 206 resume path is exempt: mid-file bytes are legitimately binary.
+        let mut sniff = Vec::new();
+        let mut sniffing = resume_offset == 0;
         let started = Instant::now();
 
         loop {
@@ -756,27 +784,51 @@ impl DownloadWorker {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
                 Err(error) => {
-                    if let Some(expected) = verify_length
-                        && received < expected
-                    {
-                        return Err(EngineError::Failed(format!(
-                            "size mismatch: the server closed the connection before the complete \
-                             message body ({received} bytes received)"
-                        ))
-                        .into());
-                    }
+                    // A body truncated mid-transfer (even with a
+                    // Content-Length) is a transient transport failure: the
+                    // retry resumes from whatever the `.part` already holds.
                     return Err(EngineError::Network(error).into());
                 }
             };
 
-            if !got_first_chunk {
-                got_first_chunk = true;
-                if resume_offset == 0 && looks_like_html(&chunk) {
-                    if is_browser_challenge(&response, &chunk) {
+            if sniffing {
+                let remaining = HTML_SNIFF_LIMIT.saturating_sub(sniff.len());
+                let take = chunk.len().min(remaining);
+                sniff.extend_from_slice(&chunk[..take]);
+                let verdict = match sniff_html_prefix(&sniff) {
+                    PrefixSniff::NeedMore if sniff.len() < HTML_SNIFF_LIMIT => {
+                        // Hold the bytes until the prefix can be classified.
+                        continue;
+                    }
+                    PrefixSniff::NeedMore => {
+                        // A full 8 KiB of leading whitespace is not HTML;
+                        // treat the body as binary instead of buffering on.
+                        PrefixSniff::NotHtml
+                    }
+                    decided => decided,
+                };
+                if verdict == PrefixSniff::Html {
+                    if is_browser_challenge(&response, &sniff) {
                         return Err(challenge_error());
                     }
                     return Err(html_error());
                 }
+                sniffing = false;
+                // Flush the held prefix and the rest of this chunk in order.
+                let mut pending = std::mem::take(&mut sniff);
+                pending.extend_from_slice(&chunk[take..]);
+                file.write_all(&pending).await?;
+                digest.update(&pending);
+                received += pending.len() as u64;
+                self.maybe_throttle(started, received, accept_ranges)
+                    .await?;
+                self.maybe_emit_progress(
+                    progress_total,
+                    resume_offset + received,
+                    received,
+                    started,
+                );
+                continue;
             }
 
             file.write_all(&chunk).await?;
@@ -787,12 +839,37 @@ impl DownloadWorker {
             self.maybe_emit_progress(progress_total, resume_offset + received, received, started);
         }
 
+        // The body ended before the prefix could be classified (a tiny binary
+        // file starting with something like `<h`): decide on what we have.
+        if sniffing && !sniff.is_empty() {
+            if looks_like_html(&sniff) {
+                if is_browser_challenge(&response, &sniff) {
+                    return Err(challenge_error());
+                }
+                return Err(html_error());
+            }
+            file.write_all(&sniff).await?;
+            digest.update(&sniff);
+            received += sniff.len() as u64;
+            self.maybe_emit_progress(progress_total, resume_offset + received, received, started);
+        }
+
         file.flush().await?;
+        // Best effort: make the bytes durable before the rename publishes
+        // them. A failed fsync must not fail an otherwise good download.
+        if let Err(error) = file.sync_all().await {
+            tracing::warn!(
+                download = ?self.record.id,
+                error = %error,
+                "could not fsync .part before publishing"
+            );
+        }
         drop(file);
 
         if let Some(expected) = verify_length
             && received != expected
         {
+            self.discard_part("Content-Length mismatch").await;
             return Err(EngineError::Failed(format!(
                 "server sent {received} bytes but promised {expected} (Content-Length mismatch)"
             ))
@@ -809,6 +886,7 @@ impl DownloadWorker {
                 hash_file(&self.part_path).await?
             };
             if actual != expected {
+                self.discard_part("SHA-256 mismatch").await;
                 return Err(checksum_mismatch(&expected, &actual));
             }
             self.record.checksum_verified = true;
@@ -840,6 +918,7 @@ impl DownloadWorker {
     async fn finalize_part(&mut self, total: u64) -> Result<(), RunError> {
         let actual = self.part_size().await;
         if actual != total {
+            self.discard_part("resume size mismatch").await;
             return Err(EngineError::Failed(format!(
                 "resume covers the whole file but the .part holds {actual} bytes \
                  (server reported {total}); restarting download"
@@ -849,6 +928,7 @@ impl DownloadWorker {
         if let Some(expected) = normalize_checksum(self.record.checksum_sha256.as_deref()) {
             let actual_hash = hash_file(&self.part_path).await?;
             if actual_hash != expected {
+                self.discard_part("SHA-256 mismatch").await;
                 return Err(checksum_mismatch(&expected, &actual_hash));
             }
             self.record.checksum_verified = true;
@@ -860,6 +940,7 @@ impl DownloadWorker {
     async fn publish(&mut self, total: u64) -> Result<(), RunError> {
         let part_size = self.part_size().await;
         if part_size != total {
+            self.discard_part("final size mismatch").await;
             return Err(EngineError::Failed(format!(
                 "final file size {part_size} != downloaded {total} bytes (filesystem error)"
             ))
@@ -871,11 +952,55 @@ impl DownloadWorker {
             tokio::fs::create_dir_all(parent).await?;
         }
 
+        // A resumed `.part` skipped the collision policy at prepare time. The
+        // final file may have appeared since (another download finished), so
+        // honour skip/keep_existing/rename here instead of renaming over it.
+        if self.resumed && self.final_path.exists() {
+            match self.settings.filename_collision {
+                CollisionPolicy::Overwrite => {}
+                CollisionPolicy::Skip => {
+                    self.discard_part("collision policy 'skip' on resume").await;
+                    let file_name = self
+                        .final_path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    return Err(RunError::Skipped(format!(
+                        "destination already exists ({file_name}) and the collision policy is \
+                         'skip'; choose another policy to proceed"
+                    )));
+                }
+                CollisionPolicy::KeepExisting => {
+                    self.discard_part("collision policy 'keep_existing' on resume")
+                        .await;
+                    return Err(RunError::KeepExisting);
+                }
+                CollisionPolicy::Rename => {
+                    let Some(resolved) =
+                        file_naming::unique_path(&self.final_path, CollisionPolicy::Rename)
+                    else {
+                        return Err(EngineError::Failed(
+                            "could not find a free filename for the resumed download".to_string(),
+                        )
+                        .into());
+                    };
+                    self.record.destination_path = resolved.to_string_lossy().into_owned();
+                    if let Some(name) = resolved.file_name() {
+                        self.record.display_name = name.to_string_lossy().into_owned();
+                    }
+                    self.final_path = resolved;
+                }
+            }
+        }
+
         match tokio::fs::rename(&self.part_path, &self.final_path).await {
             Ok(()) => {}
             // Windows refuses to replace an existing destination; the
-            // overwrite policy is the only path that can reach this.
-            Err(_) if self.final_path.exists() => {
+            // overwrite policy is the only path that can reach this. Only
+            // remove the destination when the rename *actually* failed for
+            // that reason: any other error must propagate so a good file is
+            // never deleted.
+            Err(error) if rename_blocked_by_existing(&error) && self.final_path.exists() => {
                 tokio::fs::remove_file(&self.final_path).await?;
                 tokio::fs::rename(&self.part_path, &self.final_path).await?;
             }
@@ -918,9 +1043,13 @@ impl DownloadWorker {
     }
 
     /// Cancel/pause-aware sleep in at most 100 ms slices.
+    ///
+    /// The ceiling matches [`MAX_RETRY_AFTER_SECONDS`], so even if a server
+    /// hint somehow bypassed the policy clamp the worker cannot park for
+    /// longer than 15 minutes.
     async fn sleep(&mut self, seconds: f64, accept_ranges: bool) -> Result<(), RunError> {
         let seconds = if seconds.is_finite() {
-            seconds.clamp(0.0, 86_400.0)
+            seconds.clamp(0.0, MAX_RETRY_AFTER_SECONDS)
         } else {
             0.0
         };
@@ -1096,6 +1225,28 @@ impl DownloadWorker {
             .map(|metadata| metadata.is_file())
             .unwrap_or(false)
     }
+
+    /// Delete a `.part` whose bytes can no longer be trusted.
+    ///
+    /// Used by permanent post-write failures (checksum and size mismatches)
+    /// so a manual retry starts from zero instead of resuming poisoned bytes
+    /// and failing the same way forever. Best effort: a missing file is fine
+    /// and a failed removal is only logged, never fatal.
+    async fn discard_part(&self, reason: &str) {
+        match tokio::fs::remove_file(&self.part_path).await {
+            Ok(()) => tracing::warn!(
+                download = ?self.record.id,
+                reason = reason,
+                "deleted stale .part after a permanent failure"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                download = ?self.record.id,
+                error = %error,
+                "could not delete stale .part"
+            ),
+        }
+    }
 }
 
 // -- free helpers -------------------------------------------------------------
@@ -1114,6 +1265,57 @@ fn with_part_suffix(path: &Path) -> PathBuf {
     let mut raw = path.as_os_str().to_os_string();
     raw.push(".part");
     PathBuf::from(raw)
+}
+
+/// True when a rename failed only because the destination already exists.
+///
+/// Windows reports this through `AlreadyExists` or the raw codes
+/// `ERROR_FILE_EXISTS` (80) / `ERROR_ALREADY_EXISTS` (183). Any other error
+/// (permission denied, sharing violation, disk failure) must not trigger the
+/// destructive remove-and-retry path.
+fn rename_blocked_by_existing(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        matches!(error.raw_os_error(), Some(80) | Some(183))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Pick the `If-Range` validator, preferring a strong `ETag`.
+///
+/// RFC 9110 forbids a weak validator (`W/"..."`) in `If-Range`, so a weak
+/// ETag is skipped in favour of `Last-Modified` (always strong).
+fn select_if_range_validator<'a>(
+    etag: Option<&'a str>,
+    last_modified: Option<&'a str>,
+) -> Option<&'a str> {
+    if let Some(etag) = etag
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.starts_with("W/"))
+    {
+        return Some(etag);
+    }
+    last_modified
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// Strip the request URL that `reqwest::Error`'s `Display` embeds.
+///
+/// reqwest renders `... for url (<full url>)`, and a signed query string in
+/// that URL must never reach a log line or the persisted `error_summary`.
+/// Everything from the marker to the end of the message is dropped.
+fn sanitize_transport_error(text: &str) -> String {
+    match text.find(" for url (") {
+        Some(index) => text[..index].trim_end().to_string(),
+        None => text.to_string(),
+    }
 }
 
 fn header_text(response: &Response, name: &str) -> Option<String> {
@@ -1169,21 +1371,82 @@ fn content_type_is_html(content_type: &str) -> bool {
         .eq_ignore_ascii_case("text/html")
 }
 
-fn looks_like_html(chunk: &[u8]) -> bool {
-    let mut head = chunk;
-    if head.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        head = &head[3..];
+/// Upper bound on the response prefix inspected for HTML markers.
+const HTML_SNIFF_LIMIT: usize = CHALLENGE_SNIFF_LIMIT;
+
+/// Leading byte sequences that identify an HTML/XML document.
+const HTML_START_MARKERS: [&[u8]; 7] = [
+    b"<!doctype",
+    b"<html",
+    b"<head",
+    b"<body",
+    b"<script",
+    b"<!--",
+    b"<?xml",
+];
+
+/// Result of inspecting a response prefix for HTML markers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefixSniff {
+    /// The prefix starts an HTML/XML document.
+    Html,
+    /// The prefix cannot be HTML.
+    NotHtml,
+    /// More bytes are needed before the decision is possible.
+    NeedMore,
+}
+
+fn is_sniff_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | 0x0B | 0x0C)
+}
+
+/// Body prefix with a UTF-8 BOM and leading whitespace removed.
+///
+/// Returns `None` while the prefix could still be a partial BOM, because the
+/// bytes following it are not yet known.
+fn html_head(bytes: &[u8]) -> Option<&[u8]> {
+    const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+    let rest = if bytes.starts_with(&BOM) {
+        &bytes[BOM.len()..]
+    } else if bytes.len() < BOM.len() && BOM.starts_with(bytes) {
+        return None;
+    } else {
+        bytes
+    };
+    let start = rest
+        .iter()
+        .position(|byte| !is_sniff_whitespace(*byte))
+        .unwrap_or(rest.len());
+    Some(&rest[start..])
+}
+
+/// Classify a response prefix as HTML, definitely-not-HTML, or undecidable.
+fn sniff_html_prefix(bytes: &[u8]) -> PrefixSniff {
+    let Some(head) = html_head(bytes) else {
+        return PrefixSniff::NeedMore;
+    };
+    if head.is_empty() {
+        return PrefixSniff::NeedMore;
     }
-    while let [first, rest @ ..] = head {
-        if matches!(*first, b' ' | b'\t' | b'\r' | b'\n' | 0x0B | 0x0C) {
-            head = rest;
-        } else {
-            break;
-        }
+    let probe = &head[..head.len().min(16)];
+    let lowered = probe.to_ascii_lowercase();
+    if HTML_START_MARKERS
+        .iter()
+        .any(|marker| lowered.starts_with(marker))
+    {
+        return PrefixSniff::Html;
     }
-    let head = &head[..head.len().min(1024)];
-    let lowered = head.to_ascii_lowercase();
-    lowered.starts_with(b"<!doctype html") || lowered.starts_with(b"<html")
+    if HTML_START_MARKERS
+        .iter()
+        .any(|marker| marker.starts_with(&lowered))
+    {
+        return PrefixSniff::NeedMore;
+    }
+    PrefixSniff::NotHtml
+}
+
+fn looks_like_html(bytes: &[u8]) -> bool {
+    matches!(sniff_html_prefix(bytes), PrefixSniff::Html)
 }
 
 /// Read at most [`CHALLENGE_SNIFF_LIMIT`] bytes from a response that is about
@@ -1304,6 +1567,17 @@ fn compute_eta(total: Option<u64>, done: u64, speed_bps: f64) -> Option<u64> {
     Some((remaining / speed_bps) as u64)
 }
 
+/// True when a safety error names a private/loopback destination.
+///
+/// Covers both wording families: the validation layer ("refusing to connect
+/// to private/loopback address", "all resolved addresses ...") and the
+/// connection-time resolver ("... after private-address screening").
+fn is_private_address_message(message: &str) -> bool {
+    message.contains("private-address screening")
+        || message.contains("refusing to connect to private/loopback address")
+        || message.contains("all resolved addresses")
+}
+
 /// Classify an HTTP status into a diagnostics category.
 fn classify_status(status: u16) -> FailureCategory {
     match status {
@@ -1324,7 +1598,7 @@ fn classify_failure_message(message: &str) -> FailureCategory {
     if message == HTML_ERROR {
         return FailureCategory::HtmlPage;
     }
-    if message.contains("private-address screening") {
+    if is_private_address_message(message) {
         return FailureCategory::PrivateAddress;
     }
     if message.starts_with("unsafe redirect target refused")
@@ -1359,4 +1633,81 @@ fn checksum_mismatch(expected: &str, actual: &str) -> RunError {
          the file is corrupt or the server delivered different content"
     ))
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_errors_lose_their_embedded_url() {
+        let text = "error sending request for url (https://cdn.example/f.zip?token=secret)";
+        assert_eq!(sanitize_transport_error(text), "error sending request");
+        assert_eq!(
+            sanitize_transport_error("connection reset by peer"),
+            "connection reset by peer"
+        );
+    }
+
+    #[test]
+    fn weak_etags_are_not_used_for_if_range() {
+        assert_eq!(select_if_range_validator(Some("W/\"weak\""), None), None);
+        assert_eq!(
+            select_if_range_validator(Some("W/\"weak\""), Some("Mon, 01 Jan 2024 00:00:00 GMT")),
+            Some("Mon, 01 Jan 2024 00:00:00 GMT")
+        );
+        assert_eq!(
+            select_if_range_validator(Some(" \"strong\" "), None),
+            Some("\"strong\"")
+        );
+        assert_eq!(
+            select_if_range_validator(Some("   "), Some("date")),
+            Some("date")
+        );
+    }
+
+    #[test]
+    fn rename_conflicts_are_classified_narrowly() {
+        assert!(rename_blocked_by_existing(&std::io::Error::from(
+            std::io::ErrorKind::AlreadyExists
+        )));
+        assert!(!rename_blocked_by_existing(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        #[cfg(windows)]
+        {
+            assert!(rename_blocked_by_existing(
+                &std::io::Error::from_raw_os_error(80)
+            ));
+            assert!(rename_blocked_by_existing(
+                &std::io::Error::from_raw_os_error(183)
+            ));
+            assert!(!rename_blocked_by_existing(
+                &std::io::Error::from_raw_os_error(32)
+            ));
+        }
+    }
+
+    #[test]
+    fn html_sniff_waits_for_enough_prefix() {
+        assert_eq!(sniff_html_prefix(b""), PrefixSniff::NeedMore);
+        assert_eq!(sniff_html_prefix(b"<h"), PrefixSniff::NeedMore);
+        assert_eq!(sniff_html_prefix(b"<html>"), PrefixSniff::Html);
+        assert_eq!(
+            sniff_html_prefix(b"\xEF\xBB\xBF  <!DOCTYPE html>"),
+            PrefixSniff::Html
+        );
+        assert_eq!(sniff_html_prefix(b"<!-- x -->\n<html>"), PrefixSniff::Html);
+        assert_eq!(
+            sniff_html_prefix(b"<?xml version=\"1.0\"?>"),
+            PrefixSniff::Html
+        );
+        assert_eq!(sniff_html_prefix(b"<body>"), PrefixSniff::Html);
+        assert_eq!(sniff_html_prefix(b"<head>"), PrefixSniff::Html);
+        assert_eq!(sniff_html_prefix(b"<script>"), PrefixSniff::Html);
+        assert_eq!(sniff_html_prefix(b"PK\x03\x04"), PrefixSniff::NotHtml);
+        assert_eq!(sniff_html_prefix(b"\x89PNG"), PrefixSniff::NotHtml);
+        assert!(looks_like_html(b"<html>"));
+        assert!(!looks_like_html(b"<h"));
+    }
 }

@@ -847,6 +847,35 @@ mod tests {
         assert_eq!(stored.expect("settings exist").max_simultaneous, 7);
     }
 
+    #[tokio::test]
+    async fn corrupt_settings_surface_a_startup_warning() {
+        let dir = temp_dir("corrupt-settings");
+        let database_path = dir.join("downloads.db");
+        {
+            let database = Database::init_db(&database_path).expect("open database");
+            database
+                .execute("INSERT INTO settings (id, theme) VALUES (1, 'bogus')", &[])
+                .expect("insert corrupt settings");
+        }
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (_backend, startup) = AppBackend::start(BackendConfig { database_path }, tx)
+            .expect("backend still starts on corrupt settings");
+
+        let error = startup
+            .settings_error
+            .expect("corrupt settings must be surfaced to the shell");
+        assert!(
+            error.contains("settings"),
+            "error should describe the settings row, got {error:?}"
+        );
+        assert_eq!(
+            startup.settings.max_simultaneous,
+            Settings::default().max_simultaneous,
+            "defaults are used until the user saves again"
+        );
+    }
+
     // ---- intake -----------------------------------------------------------
 
     #[tokio::test]

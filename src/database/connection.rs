@@ -111,6 +111,16 @@ impl Database {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;\nPRAGMA foreign_keys=ON;\nPRAGMA synchronous=NORMAL;",
         )?;
+        // Never rewrite a database written by a newer build: `ensure_schema`
+        // would stamp `user_version` down and the older code could corrupt
+        // rows whose shape it does not understand.
+        let user_version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if user_version > SCHEMA_VERSION {
+            return Err(RepositoryError::SchemaTooNew {
+                found: user_version,
+                supported: SCHEMA_VERSION,
+            });
+        }
         Ok(Self {
             path: raw,
             conn: Mutex::new(conn),
@@ -245,4 +255,55 @@ fn ensure_column(
         tracing::info!(table, column, "schema migration added column");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn temp_db(label: &str) -> std::path::PathBuf {
+        let unique = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "bdm-connection-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir.join("downloads.db")
+    }
+
+    #[test]
+    fn newer_schema_version_is_rejected() {
+        // Arrange: create a database and stamp it with a future schema.
+        let path = temp_db("newer");
+        let database = Database::open(&path).expect("open database");
+        database
+            .with_conn(|conn| {
+                conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)?;
+                Ok(())
+            })
+            .expect("bump schema version");
+        drop(database);
+
+        // Act
+        let error = match Database::open(&path) {
+            Ok(_) => panic!("a newer schema must be refused"),
+            Err(error) => error,
+        };
+
+        // Assert
+        assert!(
+            error.to_string().contains("newer version"),
+            "error was {error:?}"
+        );
+    }
+
+    #[test]
+    fn current_schema_version_reopens_cleanly() {
+        let path = temp_db("current");
+        Database::init_db(&path).expect("initialise");
+        Database::open(&path).expect("reopen at the current schema");
+    }
 }

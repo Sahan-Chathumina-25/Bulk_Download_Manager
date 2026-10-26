@@ -175,6 +175,17 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// The sibling `.part` path used while a download is in flight.
+///
+/// This appends `.part` to the full filename (`archive.zip` ->
+/// `archive.zip.part`), matching the worker's publish step, rather than
+/// replacing the extension.
+pub fn part_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".part");
+    PathBuf::from(name)
+}
+
 /// Apply a filename-collision policy and return the path to write to.
 ///
 /// keep_existing: existing file is authoritative; the same path is
@@ -184,18 +195,32 @@ fn home_dir() -> PathBuf {
 /// (The Python version raised ValueError on an unknown policy; the enum
 /// makes that state impossible here.)
 pub fn unique_path(path: &Path, policy: CollisionPolicy) -> Option<PathBuf> {
-    if !path.exists() {
+    unique_path_with(path, policy, Path::exists)
+}
+
+/// Like [`unique_path`], but `is_taken` decides whether a candidate path is
+/// already occupied.
+///
+/// Callers pass more than the plain on-disk check when an in-flight row or a
+/// `.part` file can also collide: the manager treats both as taken so two
+/// downloads never write the same destination.
+pub fn unique_path_with(
+    path: &Path,
+    policy: CollisionPolicy,
+    is_taken: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    if !is_taken(path) {
         return Some(path.to_path_buf());
     }
     match policy {
-        CollisionPolicy::Rename => Some(next_free_variant(path)),
+        CollisionPolicy::Rename => Some(next_free_variant(path, &is_taken)),
         CollisionPolicy::Skip => None,
         CollisionPolicy::KeepExisting | CollisionPolicy::Overwrite => Some(path.to_path_buf()),
     }
 }
 
 /// Return the first free stem (n).ext variant of an existing path.
-fn next_free_variant(path: &Path) -> PathBuf {
+fn next_free_variant(path: &Path, is_taken: &impl Fn(&Path) -> bool) -> PathBuf {
     let stem = path
         .file_stem()
         .unwrap_or_default()
@@ -207,7 +232,7 @@ fn next_free_variant(path: &Path) -> PathBuf {
         .unwrap_or_default();
     for n in 1..1000 {
         let candidate = path.with_file_name(format!("{stem} ({n}){suffix}"));
-        if !candidate.exists() {
+        if !is_taken(&candidate) {
             return candidate;
         }
     }

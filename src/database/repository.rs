@@ -17,6 +17,7 @@ use crate::config::{CollisionPolicy, Settings, Theme};
 use crate::database::connection::Database;
 use crate::models::download_item::{DownloadRecord, now_iso};
 use crate::models::download_status::DownloadState;
+use crate::services::file_naming;
 
 /// Errors raised by the repository layer.
 #[derive(Debug, Error)]
@@ -43,6 +44,22 @@ pub enum RepositoryError {
     /// A downloads row stores a state string this build does not know.
     #[error("corrupt downloads row {id}: {message}")]
     CorruptRow { id: i64, message: String },
+
+    /// The stored settings row exists but cannot be decoded or validated.
+    ///
+    /// Callers fall back to defaults *and* surface the warning instead of
+    /// silently discarding the user's preferences.
+    #[error("stored settings are invalid: {0}")]
+    CorruptSettings(String),
+
+    /// The database was written by a build with a newer schema revision.
+    ///
+    /// Refusing is safer than rewriting (and possibly losing) rows this build
+    /// does not understand.
+    #[error(
+        "database was created by a newer version (schema {found}, this build supports {supported})"
+    )]
+    SchemaTooNew { found: i64, supported: i64 },
 }
 
 /// Columns history queries may sort by (SQL identifier whitelist).
@@ -365,9 +382,12 @@ impl DownloadRepository {
 
     /// Delete history rows; returns the number of deleted rows.
     ///
-    /// When ``keep_files`` is ``false``, each deleted row's destination file
-    /// is also removed; files that no longer exist are ignored and other
-    /// files in the directory are never touched.
+    /// Rows are deleted first so a file-deletion failure can never leave a
+    /// row pointing at a file that is already gone; when ``keep_files`` is
+    /// ``false`` each deleted row's destination and its ``.part`` sibling are
+    /// then removed best-effort. Files that no longer exist are ignored,
+    /// other files in the directory are never touched, and each failure is
+    /// logged with its path rather than swallowed.
     ///
     /// Legacy quirk preserved: this uses the default history window
     /// (``limit = 100``), so a single call deletes at most 100 rows.
@@ -375,22 +395,16 @@ impl DownloadRepository {
         let rows = self.history(HistoryQuery::default())?;
         let mut removed = 0;
         for record in rows {
-            if !keep_files && !record.destination_path.is_empty() {
-                match std::fs::remove_file(&record.destination_path) {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => {
-                        tracing::warn!(
-                            path = %record.destination_path,
-                            error = %err,
-                            "could not delete download file"
-                        );
-                    }
-                }
+            if !self.delete(record.id.unwrap_or(0))? {
+                continue;
             }
-            if self.delete(record.id.unwrap_or(0))? {
-                removed += 1;
+            removed += 1;
+            if keep_files || record.destination_path.is_empty() {
+                continue;
             }
+            let destination = Path::new(&record.destination_path);
+            remove_file_best_effort(destination, "download file");
+            remove_file_best_effort(&file_naming::part_path(destination), "partial download");
         }
         Ok(removed)
     }
@@ -434,9 +448,10 @@ impl DownloadRepository {
 
     /// Load the single settings row (validated) or ``None`` when unset.
     ///
-    /// A corrupt row (bad JSON, unknown enum, failed validation) is logged
-    /// and treated as "unset"; it is never propagated as an error, matching
-    /// the Python ``except (ValueError, TypeError, KeyError)`` fallback.
+    /// A corrupt row (bad JSON, unknown enum, failed validation) is reported
+    /// as [`RepositoryError::CorruptSettings`] so the shell can warn the user
+    /// while still falling back to defaults; only a genuinely absent row
+    /// yields ``None``.
     pub fn get_settings(&self) -> Result<Option<Settings>, RepositoryError> {
         self.db.with_conn(|conn| {
             let mut stmt = conn.prepare("SELECT * FROM settings WHERE id = 1")?;
@@ -451,7 +466,7 @@ impl DownloadRepository {
                         error = %message,
                         "stored settings are invalid; falling back to defaults"
                     );
-                    Ok(None)
+                    Err(RepositoryError::CorruptSettings(message))
                 }
             }
         })
@@ -687,6 +702,26 @@ fn collect_records(rows: &mut Rows<'_>) -> Result<Vec<DownloadRecord>, Repositor
 }
 
 /// Bind a u64 as a signed SQLite integer (sizes fit comfortably in i64).
+/// Remove `path`, ignoring a missing file and logging any other failure.
+///
+/// Used for best-effort cleanup (history clearing, row removal) where a
+/// locked or already-deleted file must not abort the database operation, but
+/// the failure is still reported with its path for diagnosis.
+fn remove_file_best_effort(path: &Path, what: &str) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "could not delete {what}"
+            );
+        }
+    }
+}
+
+/// Convert a non-negative SQLite count into the model's unsigned type.
 fn to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
@@ -1222,6 +1257,41 @@ mod tests {
     }
 
     #[test]
+    fn clear_history_without_keep_files_removes_part_siblings() {
+        let (dir, _db, repo) = test_repo("clear_delete_part");
+        let destination = seed_completed_with_file(&dir, &repo, "doomed.zip");
+        let part = crate::services::file_naming::part_path(&destination);
+        std::fs::write(&part, b"partial").expect("write part");
+
+        let removed = repo.clear_history(false).expect("clear");
+
+        assert_eq!(removed, 1);
+        assert!(
+            repo.history(HistoryQuery {
+                limit: 0,
+                ..HistoryQuery::default()
+            })
+            .expect("history")
+            .is_empty()
+        );
+        assert!(!destination.exists(), "destination must be deleted");
+        assert!(!part.exists(), "the .part sibling must be deleted too");
+    }
+
+    #[test]
+    fn clear_history_keep_files_preserves_part_siblings() {
+        let (dir, _db, repo) = test_repo("clear_keep_part");
+        let destination = seed_completed_with_file(&dir, &repo, "keepme.zip");
+        let part = crate::services::file_naming::part_path(&destination);
+        std::fs::write(&part, b"partial").expect("write part");
+
+        repo.clear_history(true).expect("clear");
+
+        assert!(destination.is_file());
+        assert!(part.is_file(), "keep_files must leave the .part alone");
+    }
+
+    #[test]
     fn schema_init_is_idempotent_and_survives_reopen() {
         let dir = std::env::temp_dir().join("bdm-db-tests-reopen");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1410,18 +1480,31 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_settings_row_falls_back_to_none() {
+    fn corrupt_settings_row_is_reported() {
         let (_dir, db, repo) = test_repo("corrupt_settings");
         db.execute("INSERT INTO settings (id, theme) VALUES (1, 'bogus')", &[])
             .expect("insert corrupt theme");
-        assert!(repo.get_settings().expect("get").is_none());
+        let error = repo
+            .get_settings()
+            .expect_err("a corrupt settings row must be reported");
+        assert!(
+            matches!(error, RepositoryError::CorruptSettings(_)),
+            "error was {error:?}"
+        );
+        assert!(error.to_string().contains("settings are invalid"));
 
         db.execute(
             "UPDATE settings SET theme = 'dark', allowed_extensions = 'not json' WHERE id = 1",
             &[],
         )
         .expect("update corrupt json");
-        assert!(repo.get_settings().expect("get").is_none());
+        let error = repo
+            .get_settings()
+            .expect_err("bad JSON must be reported too");
+        assert!(
+            matches!(error, RepositoryError::CorruptSettings(_)),
+            "error was {error:?}"
+        );
     }
 
     #[test]
