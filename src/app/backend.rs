@@ -316,7 +316,16 @@ impl AppBackend {
 
         if let Some(actor) = actor {
             // A timed-out actor is abandoned by design; the process is exiting.
-            drop(runtime.block_on(tokio::time::timeout(Duration::from_secs(5), actor)));
+            //
+            // The timer must be created inside `block_on`: `tokio::time`
+            // registers it with the *ambient* runtime at construction time,
+            // and the GUI thread that drops us has none. Building the timeout
+            // as `block_on`'s argument is too early — arguments are evaluated
+            // before `block_on` enters the runtime context.
+            drop(
+                runtime
+                    .block_on(async { tokio::time::timeout(Duration::from_secs(5), actor).await }),
+            );
         }
         runtime.shutdown_timeout(Duration::from_secs(2));
     }
@@ -1108,5 +1117,137 @@ mod tests {
             "shutdown took {:?}",
             started.elapsed()
         );
+    }
+
+    // ---- plain-thread lifecycle (the real application) -------------------
+
+    /// The real application drops the backend on the GUI main thread, where no
+    /// Tokio runtime is ambient. Dropping must therefore shut the actor down
+    /// without panicking: the timer used to bound the shutdown has to be built
+    /// inside the backend's own runtime, not on the caller's thread.
+    ///
+    /// Every other test in this module is a `#[tokio::test]`, so they all take
+    /// the nested-runtime branch in `stop()` and never exercised this path.
+    #[test]
+    fn dropping_the_backend_on_a_plain_thread_shuts_down_cleanly() {
+        let site = spawn_fixture();
+        site.set_file("plain.bin", b"plain-thread-payload".to_vec());
+
+        let dir = temp_dir("plain-drop");
+        let destination = dir.join("out");
+        std::fs::create_dir_all(&destination).expect("create destination");
+        let (backend, _startup, rx) = start(&dir, settings_for(&destination));
+
+        // A normal session: queue, download and discovery all run.
+        backend.send(Command::LoadQueue);
+        wait_for(
+            &rx,
+            |event| matches!(event, UiEvent::QueueLoaded { .. }),
+            10,
+        );
+
+        backend.send(Command::AddUrls {
+            text: site.url("/files/plain.bin"),
+            destination: Some(destination.clone()),
+            filename: None,
+            checksum: None,
+            start_now: true,
+        });
+        let report = expect_batch(wait_for(
+            &rx,
+            |event| matches!(event, UiEvent::AddResult(_)),
+            10,
+        ));
+        assert_eq!(report.added, 1, "failed: {:?}", report.failed);
+
+        backend.send(Command::ScanPage {
+            url: site.url("/page"),
+        });
+        wait_for(&rx, |event| matches!(event, UiEvent::ScanFinished(_)), 20);
+
+        // This is the operation that panicked with "there is no reactor
+        // running" when the timer was constructed outside `block_on`.
+        drop(backend);
+    }
+
+    #[test]
+    fn dropping_the_backend_during_a_download_and_scan_is_bounded() {
+        let site = spawn_fixture();
+        let dir = temp_dir("plain-active");
+        let destination = dir.join("out");
+        std::fs::create_dir_all(&destination).expect("create destination");
+        let (backend, _startup, rx) = start(&dir, settings_for(&destination));
+
+        backend.send(Command::AddUrls {
+            text: site.url("/stall"),
+            destination: Some(destination.clone()),
+            filename: None,
+            checksum: None,
+            start_now: true,
+        });
+        let report = expect_batch(wait_for(
+            &rx,
+            |event| matches!(event, UiEvent::AddResult(_)),
+            10,
+        ));
+        assert_eq!(report.added, 1, "failed: {:?}", report.failed);
+
+        backend.send(Command::ScanPage {
+            url: site.url("/page"),
+        });
+
+        let started = Instant::now();
+        drop(backend);
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "shutdown took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn failed_download_only_marks_the_row_and_emits_events() {
+        let site = spawn_fixture();
+        let dir = temp_dir("plain-failure");
+        let destination = dir.join("out");
+        std::fs::create_dir_all(&destination).expect("create destination");
+        let (backend, _startup, rx) = start(&dir, settings_for(&destination));
+
+        backend.send(Command::AddUrls {
+            text: site.url("/status/404"),
+            destination: Some(destination.clone()),
+            filename: None,
+            checksum: None,
+            start_now: true,
+        });
+        let report = expect_batch(wait_for(
+            &rx,
+            |event| matches!(event, UiEvent::AddResult(_)),
+            10,
+        ));
+        assert_eq!(report.added, 1, "failed: {:?}", report.failed);
+
+        let record = match wait_for(
+            &rx,
+            |event| matches!(event, UiEvent::StateChanged(record) if record.state == DownloadState::Failed),
+            20,
+        ) {
+            UiEvent::StateChanged(record) => *record,
+            _ => unreachable!(),
+        };
+        assert!(
+            record.error_summary.is_some(),
+            "a failed row keeps its reason"
+        );
+
+        // The runtime survives the failure: a later command still works.
+        backend.send(Command::LoadQueue);
+        wait_for(
+            &rx,
+            |event| matches!(event, UiEvent::QueueLoaded { .. }),
+            10,
+        );
+
+        drop(backend);
     }
 }
