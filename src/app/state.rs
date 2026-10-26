@@ -418,7 +418,18 @@ impl DiscoveryState {
         self.selected.get(index).copied().unwrap_or(false)
     }
 
+    /// Tick or untick one candidate.
+    ///
+    /// Filtered (ad/tracker) rows can never be selected, so the bulk enqueue
+    /// path and the visible checkbox stay in agreement.
     pub fn toggle(&mut self, index: usize) {
+        let selectable = self
+            .candidates()
+            .get(index)
+            .is_some_and(|candidate| candidate.filtered_reason.is_none());
+        if !selectable {
+            return;
+        }
         if let Some(slot) = self.selected.get_mut(index) {
             *slot = !*slot;
         }
@@ -426,11 +437,15 @@ impl DiscoveryState {
 
     pub fn set_all(&mut self, selected: bool) {
         // Precompute which rows the current filter exposes: the bulk action
-        // must never touch rows the user cannot see.
+        // must never touch rows the user cannot see, nor rows the ad/tracker
+        // filter rejected.
         let visible: Vec<bool> = self
             .candidates()
             .iter()
-            .map(|candidate| self.include_unknown || candidate.is_likely_file)
+            .map(|candidate| {
+                (self.include_unknown || candidate.is_likely_file)
+                    && candidate.filtered_reason.is_none()
+            })
             .collect();
 
         for (slot, is_visible) in self.selected.iter_mut().zip(visible) {
@@ -512,6 +527,11 @@ pub struct AddDownloadsState {
     pub preview: Option<ParseResult>,
     pub error: Option<String>,
     pub outcome: Option<AddOutcome>,
+    /// A preview request is in flight; the buttons stay disabled until the
+    /// backend answers.
+    pub preview_pending: bool,
+    /// An add request is in flight; feedback is only shown once it returns.
+    pub add_pending: bool,
 }
 
 impl AddDownloadsState {
@@ -539,6 +559,8 @@ impl AddDownloadsState {
         self.preview = None;
         self.error = None;
         self.outcome = None;
+        self.preview_pending = false;
+        self.add_pending = false;
     }
 }
 
@@ -1166,6 +1188,74 @@ mod tests {
 
         discovery.set_all(false);
         assert_eq!(discovery.selected_count(), 0);
+    }
+
+    #[test]
+    fn discovery_filtered_candidates_cannot_be_selected() {
+        let mut discovery = DiscoveryState::default();
+        discovery.apply_result(DiscoveryResult {
+            candidates: vec![
+                DiscoveryCandidate {
+                    candidate_url: "http://ads.example.test/ad.zip".to_string(),
+                    filename: "ad.zip".to_string(),
+                    extension: Some("zip".to_string()),
+                    source_page_url: String::new(),
+                    content_type: None,
+                    size: Some(4096),
+                    is_likely_file: true,
+                    anchor_text: None,
+                    filtered_reason: Some("host is on the ad/tracker list".to_string()),
+                },
+                DiscoveryCandidate {
+                    candidate_url: "http://example.test/real.zip".to_string(),
+                    filename: "real.zip".to_string(),
+                    extension: Some("zip".to_string()),
+                    source_page_url: String::new(),
+                    content_type: None,
+                    size: Some(2048),
+                    is_likely_file: true,
+                    anchor_text: None,
+                    filtered_reason: None,
+                },
+                DiscoveryCandidate {
+                    candidate_url: "http://example.test/unknown".to_string(),
+                    filename: "unknown".to_string(),
+                    extension: None,
+                    source_page_url: String::new(),
+                    content_type: None,
+                    size: None,
+                    is_likely_file: false,
+                    anchor_text: None,
+                    filtered_reason: None,
+                },
+            ],
+            filtered_count: 1,
+            ..DiscoveryResult::default()
+        });
+
+        // Preselection skips the filtered row even though it is a likely file.
+        assert_eq!(discovery.selected, vec![false, true, false]);
+
+        // A direct toggle cannot select the filtered row.
+        discovery.toggle(0);
+        assert!(!discovery.is_selected(0));
+        assert_eq!(discovery.selected_count(), 1);
+
+        // Bulk selection never reaches a filtered row either, even once the
+        // unknown row becomes visible.
+        discovery.include_unknown = true;
+        discovery.set_all(true);
+        assert_eq!(discovery.selected, vec![false, true, true]);
+        assert!(!discovery.is_selected(0));
+
+        // The planner refuses filtered rows regardless of tick state.
+        let planned = discovery.candidates_for_planner();
+        assert_eq!(planned.len(), 2);
+        assert!(
+            planned
+                .iter()
+                .all(|candidate| candidate.filename != "ad.zip")
+        );
     }
 
     #[test]
