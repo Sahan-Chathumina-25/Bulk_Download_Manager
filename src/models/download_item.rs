@@ -26,6 +26,9 @@ pub struct DownloadRecord {
     pub checksum_sha256: Option<String>,
     pub checksum_verified: bool,
     pub content_type: Option<String>,
+    /// Machine-readable failure class ([`super::diagnostic::FailureCategory::as_str`]),
+    /// `None` for rows written before schema v2.
+    pub failure_category: Option<String>,
 }
 
 impl Default for DownloadRecord {
@@ -47,6 +50,7 @@ impl Default for DownloadRecord {
             checksum_sha256: None,
             checksum_verified: false,
             content_type: None,
+            failure_category: None,
         }
     }
 }

@@ -224,6 +224,8 @@ mod tests {
             content_type: None,
             size: None,
             is_likely_file: true,
+            anchor_text: None,
+            filtered_reason: None,
         }
     }
 

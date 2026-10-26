@@ -34,7 +34,9 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::config::Settings;
+use crate::models::diagnostic::host_from_url;
 use crate::models::discovered_link::{DiscoveryCandidate, DiscoveryResult};
+use crate::services::ad_filter::AdFilter;
 use crate::services::{file_naming, validation};
 
 /// Maximum redirect hops followed while fetching the page.
@@ -55,6 +57,13 @@ const HEAD_HOPS: usize = 3;
 
 const CANCEL_BEFORE_REQUEST: &str = "scan cancelled before any request was made";
 const CANCEL_DURING_SCAN: &str = "scan cancelled by the user";
+
+/// Shown when a page yields zero candidates but ships JavaScript.
+const JS_HINT: &str = "no downloadable links were found; this page may render its links with \
+     JavaScript — open it in a browser to check for direct links";
+
+/// Anchor text longer than this is truncated (chars, not bytes).
+const MAX_ANCHOR_TEXT_CHARS: usize = 200;
 
 /// Shared state around the lazily built HTTP client.
 struct CachedClient {
@@ -170,12 +179,15 @@ impl HttpLinkDiscovery {
             }
         };
 
-        for link in links {
+        let ad_filter = AdFilter::from_settings(settings);
+        for error in ad_filter.load_errors() {
+            result.errors.push(error.clone());
+        }
+
+        let mut truncated = false;
+        for (link, anchor_text) in links {
             if result.candidates.len() >= MAX_CANDIDATES {
-                tracing::warn!(
-                    limit = MAX_CANDIDATES,
-                    "discovery candidate cap reached; remaining links ignored"
-                );
+                truncated = true;
                 break;
             }
             let extension = file_naming::classify_extension(&link);
@@ -183,6 +195,10 @@ impl HttpLinkDiscovery {
                 .as_deref()
                 .is_some_and(|ext| settings.allowed_extensions.contains(ext))
                 || (settings.include_unknown_types && extension.is_some());
+            let filtered_reason = ad_filter.check_host(&host_from_url(&link));
+            if filtered_reason.is_some() {
+                result.filtered_count += 1;
+            }
             result.candidates.push(DiscoveryCandidate {
                 filename: file_naming::filename_from_url(&link),
                 candidate_url: link,
@@ -191,7 +207,24 @@ impl HttpLinkDiscovery {
                 content_type: None,
                 size: None,
                 is_likely_file,
+                anchor_text,
+                filtered_reason,
             });
+        }
+
+        if truncated {
+            tracing::warn!(
+                limit = MAX_CANDIDATES,
+                "discovery candidate cap reached; remaining links ignored"
+            );
+            result.errors.push(format!(
+                "the page contains more than {MAX_CANDIDATES} links; only the first \
+                 {MAX_CANDIDATES} were scanned"
+            ));
+        }
+
+        if result.candidates.is_empty() && contains_script_tag(&body) {
+            result.errors.push(JS_HINT.to_string());
         }
 
         if settings.respect_rate_limit && !result.candidates.is_empty() {
@@ -532,8 +565,13 @@ async fn sleep_or_cancel(duration: Duration, cancel: Option<&CancellationToken>)
 
 // -- HTML extraction ----------------------------------------------------------
 
-/// Extract and validate candidate link URLs, preserving document order.
-fn extract_links(page_url: &str, body: &[u8], allow_private: bool) -> Result<Vec<String>, String> {
+/// Extract and validate candidate links plus their anchor text, preserving
+/// document order. The text is cosmetic; classification stays URL-based.
+fn extract_links(
+    page_url: &str,
+    body: &[u8],
+    allow_private: bool,
+) -> Result<Vec<(String, Option<String>)>, String> {
     let html = String::from_utf8_lossy(body);
     let document = Html::parse_document(&html);
 
@@ -603,10 +641,27 @@ fn extract_links(page_url: &str, body: &[u8], allow_private: bool) -> Result<Vec
         if !seen_valid.insert(validated.url.clone()) {
             continue;
         }
-        links.push(validated.url);
+        links.push((validated.url, anchor_text(&element)));
     }
 
     Ok(links)
+}
+
+/// Whitespace-collapsed, length-capped anchor text (`None` when blank).
+fn anchor_text(element: &scraper::ElementRef<'_>) -> Option<String> {
+    let raw = element.text().collect::<Vec<_>>().join(" ");
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    Some(collapsed.chars().take(MAX_ANCHOR_TEXT_CHARS).collect())
+}
+
+/// ASCII case-insensitive search for `<script` in the (possibly binary) body.
+fn contains_script_tag(body: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"<script";
+    body.windows(NEEDLE.len())
+        .any(|window| window.eq_ignore_ascii_case(NEEDLE))
 }
 
 // -- HEAD enrichment ----------------------------------------------------------
@@ -1204,6 +1259,152 @@ mod tests {
         );
         assert!(
             result.errors[0].contains("timeout"),
+            "errors: {:?}",
+            result.errors
+        );
+    }
+
+    // 16
+    fn custom_filter_list(label: &str, contents: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "bdm-discovery-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("hosts.txt");
+        std::fs::write(&path, contents).expect("write filter list");
+        path
+    }
+
+    // 17
+    #[tokio::test]
+    async fn ad_host_rows_are_filtered_and_counted() {
+        let site = FakeSite::spawn().await;
+        let list = custom_filter_list("ads", "127.0.0.2\n");
+        let mut config = settings();
+        config.respect_rate_limit = false;
+        config.ad_filter_enabled = true;
+        config.ad_filter_list_path = list.to_string_lossy().into_owned();
+
+        let result = scan(&site, "/page-with-ads", &config).await;
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert_eq!(result.candidates.len(), 3);
+        assert_eq!(result.filtered_count, 1);
+
+        let ad = candidate(&result, "/ads/banner.gif");
+        let reason = ad
+            .filtered_reason
+            .as_deref()
+            .unwrap_or_else(|| panic!("ad row was not filtered: {:?}", candidate_urls(&result)));
+        assert!(reason.contains("127.0.0.2"), "reason was {reason:?}");
+
+        assert!(
+            candidate(&result, "/files/big.zip")
+                .filtered_reason
+                .is_none()
+        );
+        assert!(
+            candidate(&result, "/files/data.bin")
+                .filtered_reason
+                .is_none()
+        );
+    }
+
+    // 18
+    #[tokio::test]
+    async fn ad_rows_survive_when_the_filter_is_disabled() {
+        let site = FakeSite::spawn().await;
+        let mut config = settings();
+        config.respect_rate_limit = false;
+
+        let result = scan(&site, "/page-with-ads", &config).await;
+
+        assert_eq!(result.candidates.len(), 3);
+        assert_eq!(result.filtered_count, 0);
+        assert!(
+            result
+                .candidates
+                .iter()
+                .all(|candidate| candidate.filtered_reason.is_none())
+        );
+    }
+
+    // 19
+    #[tokio::test]
+    async fn javascript_only_page_reports_the_hint() {
+        let site = FakeSite::spawn().await;
+        let result = scan(&site, "/js-only", &settings()).await;
+
+        assert!(result.candidates.is_empty());
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.contains("may render its links with JavaScript")),
+            "errors: {:?}",
+            result.errors
+        );
+    }
+
+    // 20
+    #[tokio::test]
+    async fn anchor_text_is_captured_for_the_first_occurrence() {
+        let site = FakeSite::spawn().await;
+        let result = scan(&site, "/page", &settings()).await;
+
+        let data = candidate(&result, "/files/data.bin");
+        assert_eq!(data.anchor_text.as_deref(), Some("data (relative)"));
+
+        let manual = candidate(&result, "/docs/manual.pdf");
+        assert_eq!(manual.anchor_text.as_deref(), Some("manual"));
+    }
+
+    // 21
+    #[tokio::test]
+    async fn unreadable_custom_list_falls_back_to_builtin_with_one_error() {
+        let site = FakeSite::spawn().await;
+        let missing = std::env::temp_dir()
+            .join("bdm-missing-filter-list")
+            .join("hosts.txt");
+        let mut config = settings();
+        config.respect_rate_limit = false;
+        config.ad_filter_enabled = true;
+        config.ad_filter_list_path = missing.to_string_lossy().into_owned();
+
+        let result = scan(&site, "/page-with-ads", &config).await;
+
+        assert_eq!(result.errors.len(), 1, "errors: {:?}", result.errors);
+        assert!(
+            result.errors[0].contains("could not read the custom list"),
+            "errors: {:?}",
+            result.errors
+        );
+        // The list never loaded, so the 127.0.0.2 ad host is not excluded; the
+        // built-in list still applies (and does not match a loopback literal).
+        assert_eq!(result.filtered_count, 0);
+        assert_eq!(result.candidates.len(), 3);
+    }
+
+    // 22
+    #[tokio::test]
+    async fn page_over_the_candidate_cap_reports_truncation() {
+        let site = FakeSite::spawn().await;
+        let mut config = settings();
+        config.respect_rate_limit = false;
+
+        let result = scan(&site, "/many-links", &config).await;
+
+        assert_eq!(result.candidates.len(), MAX_CANDIDATES);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.contains("more than 500 links")),
             "errors: {:?}",
             result.errors
         );

@@ -88,7 +88,7 @@ pub fn show(app: &mut BulkDownloadApp, ui: &mut Ui) {
         let records = app.history.records.clone();
 
         egui::Grid::new("history_rows")
-            .num_columns(6)
+            .num_columns(7)
             .spacing([14.0, 8.0])
             .striped(true)
             .show(ui, |ui| {
@@ -103,6 +103,13 @@ pub fn show(app: &mut BulkDownloadApp, ui: &mut Ui) {
                 reload |= sort_header(ui, &mut app.history, "Size", "expected_size");
                 reload |= sort_header(ui, &mut app.history, "Created", "created_at");
                 reload |= sort_header(ui, &mut app.history, "Completed", "completed_at");
+                // Not sortable: the column is free text, not a stored order key.
+                ui.label(
+                    RichText::new("Error")
+                        .color(theme::MUTED)
+                        .size(12.0)
+                        .strong(),
+                );
                 ui.end_row();
 
                 for record in &records {
@@ -138,6 +145,20 @@ pub fn show(app: &mut BulkDownloadApp, ui: &mut Ui) {
                         .color(theme::MUTED)
                         .size(12.0),
                     );
+                    let error = ui.label(
+                        RichText::new(record.error_summary.as_deref().unwrap_or(format::DASH))
+                            .color(if record.failure_category.is_some() {
+                                theme::ERROR
+                            } else {
+                                theme::MUTED
+                            })
+                            .size(12.0),
+                    );
+                    if let Some(summary) = record.error_summary.as_deref() {
+                        // The cell is truncated by the grid; the tooltip always
+                        // carries the full engine message.
+                        error.on_hover_text(summary);
+                    }
                     ui.end_row();
                 }
             });

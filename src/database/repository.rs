@@ -72,9 +72,9 @@ pub const HISTORY_STATES: [DownloadState; 4] = [
     DownloadState::Interrupted,
 ];
 
-const INSERT_SQL: &str = "INSERT INTO downloads (source_url, display_name, destination_path, state, downloaded_bytes, expected_size, created_at, completed_at, retry_count, error_summary, etag, last_modified, checksum_sha256, checksum_verified, content_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+const INSERT_SQL: &str = "INSERT INTO downloads (source_url, display_name, destination_path, state, downloaded_bytes, expected_size, created_at, completed_at, retry_count, error_summary, etag, last_modified, checksum_sha256, checksum_verified, content_type, failure_category) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
-const UPDATE_SQL: &str = "UPDATE downloads SET source_url = ?, display_name = ?, destination_path = ?, state = ?, downloaded_bytes = ?, expected_size = ?, created_at = ?, completed_at = ?, retry_count = ?, error_summary = ?, etag = ?, last_modified = ?, checksum_sha256 = ?, checksum_verified = ?, content_type = ? WHERE id = ?";
+const UPDATE_SQL: &str = "UPDATE downloads SET source_url = ?, display_name = ?, destination_path = ?, state = ?, downloaded_bytes = ?, expected_size = ?, created_at = ?, completed_at = ?, retry_count = ?, error_summary = ?, etag = ?, last_modified = ?, checksum_sha256 = ?, checksum_verified = ?, content_type = ?, failure_category = ? WHERE id = ?";
 
 const SETTINGS_UPSERT_SQL: &str = "
 INSERT INTO settings (
@@ -82,8 +82,8 @@ INSERT INTO settings (
     retry_count, retry_delay, buffer_size, bandwidth_limit_bps,
     filename_collision, notifications, theme, user_agent,
     include_unknown_types, allowed_extensions, respect_rate_limit,
-    allow_private_addresses
-) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    allow_private_addresses, ad_filter_enabled, ad_filter_list_path
+) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     default_destination_dir=excluded.default_destination_dir,
     max_simultaneous=excluded.max_simultaneous,
@@ -99,10 +99,12 @@ ON CONFLICT(id) DO UPDATE SET
     include_unknown_types=excluded.include_unknown_types,
     allowed_extensions=excluded.allowed_extensions,
     respect_rate_limit=excluded.respect_rate_limit,
-    allow_private_addresses=excluded.allow_private_addresses
+    allow_private_addresses=excluded.allow_private_addresses,
+    ad_filter_enabled=excluded.ad_filter_enabled,
+    ad_filter_list_path=excluded.ad_filter_list_path
 ";
 
-/// Owned values plus borrows that make up the 15 column bindings of a record.
+/// Owned values plus borrows that make up the 16 column bindings of a record.
 struct RecordParams<'a> {
     record: &'a DownloadRecord,
     state: &'static str,
@@ -125,7 +127,7 @@ impl<'a> RecordParams<'a> {
     }
 
     /// Bindings in the exact column order used by INSERT/UPDATE.
-    fn values(&self) -> [&dyn ToSql; 15] {
+    fn values(&self) -> [&dyn ToSql; 16] {
         [
             &self.record.source_url,
             &self.record.display_name,
@@ -142,6 +144,7 @@ impl<'a> RecordParams<'a> {
             &self.record.checksum_sha256,
             &self.checksum_verified,
             &self.record.content_type,
+            &self.record.failure_category,
         ]
     }
 }
@@ -474,8 +477,9 @@ impl DownloadRepository {
         };
         let respect_rate_limit = bool_to_i64(settings.respect_rate_limit);
         let allow_private_addresses = bool_to_i64(settings.allow_private_addresses);
+        let ad_filter_enabled = bool_to_i64(settings.ad_filter_enabled);
 
-        let bindings: [&dyn ToSql; 15] = [
+        let bindings: [&dyn ToSql; 17] = [
             &settings.default_destination_dir,
             &max_simultaneous,
             &connection_timeout,
@@ -491,6 +495,8 @@ impl DownloadRepository {
             &allowed_extensions,
             &respect_rate_limit,
             &allow_private_addresses,
+            &ad_filter_enabled,
+            &settings.ad_filter_list_path,
         ];
         self.db.execute(SETTINGS_UPSERT_SQL, &bindings)?;
         Ok(())
@@ -524,6 +530,7 @@ fn record_from_row(row: &Row<'_>) -> Result<DownloadRecord, RepositoryError> {
     let checksum_sha256: Option<String> = row.get("checksum_sha256")?;
     let checksum_verified: Option<i64> = row.get("checksum_verified")?;
     let content_type: Option<String> = row.get("content_type")?;
+    let failure_category: Option<String> = row.get("failure_category")?;
 
     Ok(DownloadRecord {
         id: Some(id),
@@ -542,6 +549,7 @@ fn record_from_row(row: &Row<'_>) -> Result<DownloadRecord, RepositoryError> {
         checksum_sha256,
         checksum_verified: checksum_verified.map(|value| value != 0).unwrap_or(false),
         content_type,
+        failure_category,
     })
 }
 
@@ -629,6 +637,12 @@ fn settings_from_row(row: &Row<'_>) -> Result<Settings, String> {
     let allow_private_addresses: i64 = row
         .get("allow_private_addresses")
         .map_err(|err| err.to_string())?;
+    let ad_filter_enabled: Option<i64> = row
+        .get("ad_filter_enabled")
+        .map_err(|err| err.to_string())?;
+    let ad_filter_list_path: Option<String> = row
+        .get("ad_filter_list_path")
+        .map_err(|err| err.to_string())?;
 
     let collision = CollisionPolicy::parse(&filename_collision)
         .ok_or_else(|| format!("unknown filename_collision {filename_collision:?}"))?;
@@ -657,6 +671,8 @@ fn settings_from_row(row: &Row<'_>) -> Result<Settings, String> {
         allowed_extensions: extensions.into_iter().collect(),
         respect_rate_limit: respect_rate_limit != 0,
         allow_private_addresses: allow_private_addresses != 0,
+        ad_filter_enabled: ad_filter_enabled.unwrap_or(0) != 0,
+        ad_filter_list_path: ad_filter_list_path.unwrap_or_default(),
     }
     .validated()
 }
@@ -807,6 +823,7 @@ mod tests {
             checksum_sha256: Some("a".repeat(64)),
             checksum_verified: true,
             content_type: Some("application/zip".to_string()),
+            failure_category: Some("checksum_mismatch".to_string()),
         };
 
         repo.add(&mut record).expect("add");
@@ -856,6 +873,8 @@ mod tests {
             allowed_extensions: extensions,
             respect_rate_limit: false,
             allow_private_addresses: true,
+            ad_filter_enabled: true,
+            ad_filter_list_path: dir.join("ads.txt").to_string_lossy().into_owned(),
         }
         .validated()
         .expect("valid settings");
@@ -884,6 +903,8 @@ mod tests {
             loaded.allow_private_addresses,
             saved.allow_private_addresses
         );
+        assert_eq!(loaded.ad_filter_enabled, saved.ad_filter_enabled);
+        assert_eq!(loaded.ad_filter_list_path, saved.ad_filter_list_path);
     }
 
     #[test]
@@ -1222,6 +1243,59 @@ mod tests {
         let repo = DownloadRepository::new(Arc::new(Database::init_db(&path).expect("reopen")));
         let fetched = repo.get(id).expect("get").expect("row");
         assert_eq!(fetched.source_url, "http://example.invalid/reopen.zip");
+    }
+
+    #[test]
+    fn schema_v2_migration_adds_failure_category_to_old_databases() {
+        let dir = std::env::temp_dir().join("bdm-db-tests-migrate-v2");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("downloads.db");
+
+        // A v1 database: identical to today's schema minus failure_category.
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open v1");
+            conn.execute_batch(
+                "CREATE TABLE downloads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_url TEXT NOT NULL,
+                    display_name TEXT NOT NULL DEFAULT '',
+                    destination_path TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL DEFAULT 'queued',
+                    downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+                    expected_size INTEGER,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    completed_at TEXT,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    error_summary TEXT,
+                    etag TEXT,
+                    last_modified TEXT,
+                    checksum_sha256 TEXT,
+                    checksum_verified INTEGER NOT NULL DEFAULT 0,
+                    content_type TEXT
+                );
+                INSERT INTO downloads (source_url, display_name, state, created_at)
+                VALUES ('http://example.invalid/old.zip', 'old.zip', 'failed',
+                        '2026-01-01T00:00:00+00:00');",
+            )
+            .expect("seed v1 schema");
+        }
+
+        // Opening through init_db migrates the file in place.
+        let repo = DownloadRepository::new(Arc::new(Database::init_db(&path).expect("migrate")));
+        let mut rows = repo.list_all().expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].failure_category, None);
+
+        // The migrated column is writable through the normal update path.
+        let mut record = rows.remove(0);
+        record.failure_category = Some("html_page".to_string());
+        repo.update(&record).expect("update");
+        let fetched = repo.get(record.id.expect("id")).expect("get").expect("row");
+        assert_eq!(fetched.failure_category.as_deref(), Some("html_page"));
+
+        // Re-running init_db is idempotent (no duplicate-column error).
+        Database::init_db(&path).expect("second migrate");
     }
 
     #[test]

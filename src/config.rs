@@ -112,6 +112,10 @@ pub struct Settings {
     pub respect_rate_limit: bool,
     /// Escape hatch for LAN/local testing.
     pub allow_private_addresses: bool,
+    /// Mark discovered links on known ad/tracker hosts as filtered.
+    pub ad_filter_enabled: bool,
+    /// Optional path to an extra denylist (hosts-file syntax).
+    pub ad_filter_list_path: String,
 }
 
 impl Default for Settings {
@@ -135,6 +139,8 @@ impl Default for Settings {
                 .collect(),
             respect_rate_limit: true,
             allow_private_addresses: false,
+            ad_filter_enabled: false,
+            ad_filter_list_path: String::new(),
         }
     }
 }
@@ -317,7 +323,9 @@ mod json_tests {
         assert_eq!(back.theme, Theme::Dark);
         assert!(back.allowed_extensions.contains("ipa"));
         // Keys are sorted like the Python json.dumps(sort_keys=True).
-        assert!(json.starts_with(r#"{"allow_private_addresses":"#));
+        assert!(json.starts_with(r#"{"ad_filter_enabled":"#));
+        assert!(!back.ad_filter_enabled);
+        assert!(back.ad_filter_list_path.is_empty());
     }
 
     #[test]

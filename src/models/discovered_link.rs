@@ -14,6 +14,13 @@ pub struct DiscoveryCandidate {
     pub content_type: Option<String>,
     pub size: Option<u64>,
     pub is_likely_file: bool,
+    /// Anchor text of the link, whitespace-collapsed and length-capped
+    /// (`None` for empty anchors). Informational only: classification is
+    /// still driven by the URL, never by the text.
+    pub anchor_text: Option<String>,
+    /// `Some(reason)` when the ad/tracker filter matched this host. Filtered
+    /// rows stay visible but are never enqueued.
+    pub filtered_reason: Option<String>,
 }
 
 /// Outcome of one page scan; scan problems land in errors, never panic
@@ -24,6 +31,8 @@ pub struct DiscoveryResult {
     pub candidates: Vec<DiscoveryCandidate>,
     pub errors: Vec<String>,
     pub elapsed_seconds: f64,
+    /// How many candidates the ad/tracker filter marked.
+    pub filtered_count: usize,
 }
 
 /// The result of planning which checked candidates may join the queue

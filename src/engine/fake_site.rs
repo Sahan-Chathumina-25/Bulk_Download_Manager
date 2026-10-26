@@ -326,6 +326,15 @@ async fn route(site: &Arc<FakeSite>, stream: &mut TcpStream, request: &Request) 
     if path == "/page" {
         return serve_page(site, stream).await;
     }
+    if path == "/page-with-ads" {
+        return serve_page_with_ads(site, stream).await;
+    }
+    if path == "/js-only" {
+        return serve_js_only(stream).await;
+    }
+    if path == "/many-links" {
+        return serve_many_links(stream).await;
+    }
     if path == "/robots.txt" {
         let body = lock(&site.robots).clone();
         return match body {
@@ -526,6 +535,72 @@ async fn serve_page(site: &Arc<FakeSite>, stream: &mut TcpStream) -> io::Result<
         ),
         port = port
     );
+    write_response(
+        stream,
+        200,
+        "OK",
+        &[("Content-Type", "text/html; charset=utf-8".to_string())],
+        page.as_bytes(),
+    )
+    .await
+}
+
+async fn serve_page_with_ads(site: &Arc<FakeSite>, stream: &mut TcpStream) -> io::Result<()> {
+    let port = site.addr.port();
+    // The "ad" host is `127.0.0.2`, a loopback literal, so link validation
+    // needs no DNS lookup and the filter list can name it directly. Its target
+    // ends in `.gif` on purpose: a plausible extension must not stop the
+    // filter from excluding the row.
+    let page = format!(
+        concat!(
+            "<!doctype html><html><head><title>fixture page with ads</title></head><body>",
+            "<a href=\"/files/big.zip\">big archive</a>",
+            "<a href=\"http://127.0.0.1:{port}/files/data.bin\">data (absolute)</a>",
+            "<a href=\"http://127.0.0.2:{port}/ads/banner.gif\">sponsor banner</a>",
+            "</body></html>"
+        ),
+        port = port
+    );
+    write_response(
+        stream,
+        200,
+        "OK",
+        &[("Content-Type", "text/html; charset=utf-8".to_string())],
+        page.as_bytes(),
+    )
+    .await
+}
+
+/// A page whose links only exist after client-side rendering.
+async fn serve_js_only(stream: &mut TcpStream) -> io::Result<()> {
+    let page = concat!(
+        "<!doctype html><html><head><title>fixture js page</title>",
+        "<script src=\"/app.js\"></script></head>",
+        "<body><div id=\"root\"></div>",
+        "<script>document.getElementById('root').textContent = 'built at runtime';</script>",
+        "</body></html>"
+    );
+    write_response(
+        stream,
+        200,
+        "OK",
+        &[("Content-Type", "text/html; charset=utf-8".to_string())],
+        page.as_bytes(),
+    )
+    .await
+}
+
+/// A page with one link more than the discovery candidate cap, so the
+/// truncation warning path is exercised.
+async fn serve_many_links(stream: &mut TcpStream) -> io::Result<()> {
+    const LINKS: usize = 501;
+    let mut page = String::from("<!doctype html><html><body>");
+    for index in 0..LINKS {
+        page.push_str(&format!(
+            "<a href=\"/files/file-{index}.bin\">file {index}</a>"
+        ));
+    }
+    page.push_str("</body></html>");
     write_response(
         stream,
         200,

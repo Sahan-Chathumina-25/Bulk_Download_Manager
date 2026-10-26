@@ -44,6 +44,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{CollisionPolicy, Settings};
 use crate::database::repository::DownloadRepository;
 use crate::errors::UnsafeUrlError;
+use crate::models::diagnostic::{Diagnostic, FailureCategory, host_from_url};
 use crate::models::download_item::{DownloadRecord, now_iso};
 use crate::models::download_status::DownloadState;
 use crate::services::{file_naming, validation};
@@ -131,6 +132,27 @@ impl EngineError {
             _ => self.to_string(),
         }
     }
+
+    /// Structured failure class for the diagnostics column.
+    fn category(&self) -> FailureCategory {
+        match self {
+            Self::TransientHttp { status, .. } | Self::UnexpectedStatus(status) => {
+                classify_status(*status)
+            }
+            Self::AuthRequired(_) => FailureCategory::AuthRequired,
+            Self::NotFound(_) => FailureCategory::NotFound,
+            Self::Network(error) if error.is_timeout() => FailureCategory::Timeout,
+            Self::Network(_) => FailureCategory::Network,
+            Self::Failed(message) => classify_failure_message(message),
+            Self::UnsafeUrl(error) => {
+                if error.0.contains("private-address screening") {
+                    FailureCategory::PrivateAddress
+                } else {
+                    FailureCategory::Unknown
+                }
+            }
+        }
+    }
 }
 
 /// Events a running worker emits (progress snapshots and state changes).
@@ -184,6 +206,12 @@ pub struct DownloadWorker {
     final_path: PathBuf,
     part_path: PathBuf,
     last_emit: Instant,
+    /// When this worker started (diagnostics).
+    started_at: Instant,
+    /// Last HTTP status observed (diagnostics only; never drives control flow).
+    diagnostic_status: Option<u16>,
+    /// Redirect hops followed so far (diagnostics only).
+    redirect_count: u32,
 }
 
 impl DownloadWorker {
@@ -224,6 +252,9 @@ impl DownloadWorker {
             final_path,
             part_path,
             last_emit: Instant::now() - PROGRESS_INTERVAL - Duration::from_millis(1),
+            started_at: Instant::now(),
+            diagnostic_status: None,
+            redirect_count: 0,
         }
     }
 
@@ -237,17 +268,32 @@ impl DownloadWorker {
         match outcome {
             Ok(()) => self.settle_success(),
             Err(RunError::Paused) => self.record.state = DownloadState::Paused,
-            Err(RunError::Cancelled) => self.record.state = DownloadState::Cancelled,
+            Err(RunError::Cancelled) => {
+                self.record.state = DownloadState::Cancelled;
+                self.record.failure_category =
+                    Some(FailureCategory::Cancelled.as_str().to_string());
+            }
             Err(RunError::KeepExisting) => self.settle_keep_existing(),
             Err(RunError::Skipped(message)) => {
+                // Declining an existing destination settles as cancelled, but
+                // the reason is a collision, not a user action.
                 self.record.state = DownloadState::Cancelled;
                 self.record.error_summary = Some(message);
+                self.record.failure_category =
+                    Some(FailureCategory::Collision.as_str().to_string());
             }
-            Err(RunError::Engine(error)) => self.fail(error.failure_message()),
-            Err(RunError::Io(error)) => self.fail(format!("filesystem error: {error}")),
-            Err(RunError::FreshRestart) | Err(RunError::PartComplete(_)) => {
-                self.fail("internal error: unexpected restart signal".to_string());
+            Err(RunError::Engine(error)) => {
+                let category = error.category();
+                self.fail(error.failure_message(), category);
             }
+            Err(RunError::Io(error)) => self.fail(
+                format!("filesystem error: {error}"),
+                FailureCategory::Filesystem,
+            ),
+            Err(RunError::FreshRestart) | Err(RunError::PartComplete(_)) => self.fail(
+                "internal error: unexpected restart signal".to_string(),
+                FailureCategory::Unknown,
+            ),
         }
         self.persist();
         self.emit_state();
@@ -443,6 +489,7 @@ impl DownloadWorker {
             };
 
             let status = response.status().as_u16();
+            self.diagnostic_status = Some(status);
             if REDIRECT_STATUSES.contains(&status) {
                 let location = header_text(&response, "Location").unwrap_or_default();
                 drop(response);
@@ -455,6 +502,7 @@ impl DownloadWorker {
                         self.pin_validated(&validated);
                         current = validated.url;
                         self.current_url = current.clone();
+                        self.redirect_count += 1;
                         continue;
                     }
                     Err(error) => {
@@ -592,12 +640,15 @@ impl DownloadWorker {
                 .map(|value| value.to_ascii_lowercase().contains("bytes"))
                 .unwrap_or(false);
 
+        // Capture validators and the content type *before* the HTML check so
+        // a landing/login page still leaves diagnostic context on the row.
+        self.capture_validators(&response, &content_type);
+
         // Refuse an HTML landing/login page before writing any bytes.
         if content_type_is_html(&content_type) {
             return Err(html_error());
         }
 
-        self.capture_validators(&response, &content_type);
         let progress_total = if is_resume {
             self.record.expected_size
         } else {
@@ -884,6 +935,7 @@ impl DownloadWorker {
         // Deliberate improvement over legacy: a completed download must not
         // keep a stale failure summary from an earlier attempt.
         self.record.error_summary = None;
+        self.record.failure_category = None;
     }
 
     fn settle_keep_existing(&mut self) {
@@ -903,13 +955,41 @@ impl DownloadWorker {
                 "collision policy is 'keep_existing' but the existing file is no longer \
                  present on disk; retry to download it again"
                     .to_string(),
+                FailureCategory::Collision,
             ),
         }
     }
 
-    fn fail(&mut self, message: String) {
+    /// Settle the record as failed and emit a redacted diagnostic.
+    ///
+    /// `message` is the user-facing `error_summary` (unchanged wording); the
+    /// category and the structured context are stored/logged separately.
+    fn fail(&mut self, message: String, category: FailureCategory) {
         self.record.state = DownloadState::Failed;
         self.record.error_summary = Some(message);
+        self.record.failure_category = Some(category.as_str().to_string());
+
+        let diagnostic = Diagnostic {
+            download_id: self.record.id,
+            host: host_from_url(&self.current_url),
+            redirect_count: self.redirect_count,
+            status: self.diagnostic_status,
+            content_type: self.record.content_type.clone(),
+            category,
+            retries: self.record.retry_count,
+            elapsed_seconds: self.started_at.elapsed().as_secs_f64(),
+        };
+        // Host only: never the URL, its query string, or any credentials.
+        tracing::warn!(
+            download = ?diagnostic.download_id,
+            category = diagnostic.category.as_str(),
+            host = %diagnostic.host,
+            status = ?diagnostic.status,
+            redirects = diagnostic.redirect_count,
+            retries = diagnostic.retries,
+            elapsed_seconds = diagnostic.elapsed_seconds,
+            "download failed"
+        );
     }
 
     fn persist(&self) {
@@ -1084,6 +1164,51 @@ fn compute_eta(total: Option<u64>, done: u64, speed_bps: f64) -> Option<u64> {
     }
     let remaining = (total - done) as f64;
     Some((remaining / speed_bps) as u64)
+}
+
+/// Classify an HTTP status into a diagnostics category.
+fn classify_status(status: u16) -> FailureCategory {
+    match status {
+        401 | 403 => FailureCategory::AuthRequired,
+        404 | 410 => FailureCategory::NotFound,
+        408 => FailureCategory::Timeout,
+        429 | 500..=599 => FailureCategory::ServerError,
+        _ => FailureCategory::Unknown,
+    }
+}
+
+/// Classify a message the engine itself produced.
+///
+/// The `error_summary` strings are frozen (tests and stored rows depend on
+/// their exact wording), so this maps the prefixes the worker generates rather
+/// than rewording them. Anything unrecognised is `Unknown` — never a panic.
+fn classify_failure_message(message: &str) -> FailureCategory {
+    if message == HTML_ERROR {
+        return FailureCategory::HtmlPage;
+    }
+    if message.contains("private-address screening") {
+        return FailureCategory::PrivateAddress;
+    }
+    if message.starts_with("unsafe redirect target refused")
+        || message.starts_with("too many redirects")
+    {
+        return FailureCategory::RedirectRejected;
+    }
+    if message.starts_with("SHA-256 checksum mismatch") {
+        return FailureCategory::ChecksumMismatch;
+    }
+    if message.starts_with("filesystem error") {
+        return FailureCategory::Filesystem;
+    }
+    if message.contains("destination already exists")
+        || message.starts_with("collision policy is 'keep_existing'")
+    {
+        return FailureCategory::Collision;
+    }
+    if message.contains("size mismatch") || message.contains("Content-Length mismatch") {
+        return FailureCategory::Network;
+    }
+    FailureCategory::Unknown
 }
 
 fn html_error() -> RunError {

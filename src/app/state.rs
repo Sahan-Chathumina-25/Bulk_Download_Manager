@@ -372,6 +372,8 @@ pub struct DiscoveryState {
     pub selected: Vec<bool>,
     /// Show rows that do not look like files.
     pub include_unknown: bool,
+    /// Result of the last "Add Selected to Queue" action.
+    pub outcome: Option<AddOutcome>,
 }
 
 impl DiscoveryState {
@@ -380,10 +382,11 @@ impl DiscoveryState {
         self.selected = result
             .candidates
             .iter()
-            .map(|candidate| candidate.is_likely_file)
+            .map(|candidate| candidate.is_likely_file && candidate.filtered_reason.is_none())
             .collect();
         self.status = scan_summary(&result);
         self.result = Some(result);
+        self.outcome = None;
         self.scanning = false;
     }
 
@@ -391,6 +394,7 @@ impl DiscoveryState {
         self.result = None;
         self.selected.clear();
         self.status.clear();
+        self.outcome = None;
         self.scanning = false;
     }
 
@@ -458,11 +462,14 @@ impl DiscoveryState {
     /// `checked_candidates` filters on `is_likely_file`, so the UI's tick state
     /// is folded into that flag on a clone. The scan result itself is left
     /// untouched so the table keeps showing the real classification.
+    /// Ad/tracker-filtered rows are never handed to the planner, even if the
+    /// user ticks them.
     pub fn candidates_for_planner(&self) -> Vec<DiscoveryCandidate> {
         self.candidates()
             .iter()
             .zip(&self.selected)
             .filter(|(_, ticked)| **ticked)
+            .filter(|(candidate, _)| candidate.filtered_reason.is_none())
             .map(|(candidate, _)| DiscoveryCandidate {
                 is_likely_file: true,
                 ..candidate.clone()
@@ -478,12 +485,19 @@ pub fn scan_summary(result: &DiscoveryResult) -> String {
         .iter()
         .filter(|candidate| candidate.is_likely_file)
         .count();
-    format!(
+    let mut summary = format!(
         "Found {} link(s) ({} likely file(s)) in {:.1}s — tick rows then \"Add Selected to Queue\".",
         result.candidates.len(),
         likely,
         result.elapsed_seconds
-    )
+    );
+    if result.filtered_count > 0 {
+        summary.push_str(&format!(
+            " {} filtered as ads/trackers.",
+            result.filtered_count
+        ));
+    }
+    summary
 }
 
 /// Add Downloads form.
@@ -1082,6 +1096,8 @@ mod tests {
                     content_type: None,
                     size: Some(2048),
                     is_likely_file: true,
+                    anchor_text: None,
+                    filtered_reason: None,
                 },
                 DiscoveryCandidate {
                     candidate_url: "http://example.test/about".to_string(),
@@ -1091,10 +1107,13 @@ mod tests {
                     content_type: None,
                     size: None,
                     is_likely_file: false,
+                    anchor_text: None,
+                    filtered_reason: None,
                 },
             ],
             errors: Vec::new(),
             elapsed_seconds: 0.25,
+            filtered_count: 0,
         });
 
         assert_eq!(discovery.selected_count(), 1);
@@ -1119,6 +1138,8 @@ mod tests {
                     content_type: None,
                     size: None,
                     is_likely_file: true,
+                    anchor_text: None,
+                    filtered_reason: None,
                 },
                 DiscoveryCandidate {
                     candidate_url: "http://example.test/b".to_string(),
@@ -1128,6 +1149,8 @@ mod tests {
                     content_type: None,
                     size: None,
                     is_likely_file: false,
+                    anchor_text: None,
+                    filtered_reason: None,
                 },
             ],
             ..DiscoveryResult::default()
@@ -1157,6 +1180,8 @@ mod tests {
                 content_type: None,
                 size: None,
                 is_likely_file: false,
+                anchor_text: None,
+                filtered_reason: None,
             }],
             ..DiscoveryResult::default()
         });

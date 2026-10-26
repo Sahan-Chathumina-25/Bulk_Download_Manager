@@ -259,6 +259,7 @@ impl BulkDownloadApp {
                 if let Some((_, reason)) = outcome.failed.first() {
                     self.toast(Severity::Warning, reason.clone());
                 }
+                self.discovery.outcome = Some(outcome);
             }
             UiEvent::Started(started) => {
                 if started > 0 {

@@ -18,7 +18,10 @@ use rusqlite::{Connection, ToSql};
 use crate::database::repository::RepositoryError;
 
 /// Schema revision written by this build.
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// v2 added `downloads.failure_category` plus the two ad-filter settings
+/// columns; see [`ensure_column`] for the in-place migration.
+pub const SCHEMA_VERSION: i64 = 2;
 
 const DOWNLOADS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS downloads (
@@ -37,7 +40,8 @@ CREATE TABLE IF NOT EXISTS downloads (
     last_modified TEXT,
     checksum_sha256 TEXT,
     checksum_verified INTEGER NOT NULL DEFAULT 0,
-    content_type TEXT
+    content_type TEXT,
+    failure_category TEXT
 )
 ";
 
@@ -58,7 +62,9 @@ CREATE TABLE IF NOT EXISTS settings (
     include_unknown_types INTEGER NOT NULL DEFAULT 0,
     allowed_extensions TEXT NOT NULL DEFAULT '[]',
     respect_rate_limit INTEGER NOT NULL DEFAULT 1,
-    allow_private_addresses INTEGER NOT NULL DEFAULT 0
+    allow_private_addresses INTEGER NOT NULL DEFAULT 0,
+    ad_filter_enabled INTEGER NOT NULL DEFAULT 0,
+    ad_filter_list_path TEXT NOT NULL DEFAULT ''
 )
 ";
 
@@ -129,12 +135,30 @@ impl Database {
         &self.path
     }
 
-    /// Create all tables/indexes if absent (idempotent).
+    /// Create all tables/indexes if absent and migrate older databases.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` never alters an existing table, so new
+    /// columns need an explicit, idempotent `ALTER TABLE` (see
+    /// [`ensure_column`]).
     pub fn ensure_schema(&self) -> Result<(), RepositoryError> {
         let conn = self.lock();
         conn.execute_batch(DOWNLOADS_SCHEMA)?;
         conn.execute_batch(SETTINGS_SCHEMA)?;
         conn.execute_batch(INDEX_SCHEMA)?;
+        ensure_column(&conn, "downloads", "failure_category", "TEXT")?;
+        ensure_column(
+            &conn,
+            "settings",
+            "ad_filter_enabled",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            &conn,
+            "settings",
+            "ad_filter_list_path",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -185,4 +209,40 @@ impl Database {
     fn lock(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().expect("database mutex poisoned")
     }
+}
+
+/// Add `column` to `table` when the database predates it.
+///
+/// `PRAGMA table_info` lists the existing columns, so the migration runs at
+/// most once per database and is a no-op on freshly created files (every
+/// migrated column is already part of the `CREATE TABLE` statements). Rows
+/// written before the upgrade keep the column's `NULL`/default value.
+///
+/// `table` and `column` are compile-time literals supplied by this module (and
+/// are covered by the tests below); they are never user input.
+fn ensure_column(
+    conn: &Connection,
+    table: &'static str,
+    column: &'static str,
+    declaration: &str,
+) -> Result<(), RepositoryError> {
+    let mut present = false;
+    {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name.eq_ignore_ascii_case(column) {
+                present = true;
+                break;
+            }
+        }
+    }
+    if !present {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+        ))?;
+        tracing::info!(table, column, "schema migration added column");
+    }
+    Ok(())
 }

@@ -1264,3 +1264,127 @@ async fn apply_settings_lowering_the_cap_blocks_new_dispatches() {
 
     harness.manager.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Structured failure diagnostics (phase 6.5)
+// ---------------------------------------------------------------------------
+
+/// Shorthand: the stored category, or `""` when the row has none.
+fn category_of(record: &DownloadRecord) -> &str {
+    record.failure_category.as_deref().unwrap_or_default()
+}
+
+#[tokio::test]
+async fn html_mistake_persists_html_category_and_content_type() {
+    let site = FakeSite::spawn().await;
+    let harness = harness("diag-html", settings_for(&temp_dir("diag-html-settings")));
+    let record = harness
+        .manager
+        .add_download(&site.url("/html-as-file"), None, Some(&harness.dir), None)
+        .expect("add download");
+    let done = run_to_terminal(&harness, record.id.expect("id")).await;
+
+    assert_eq!(done.state, DownloadState::Failed);
+    assert_eq!(category_of(&done), "html_page");
+    // Validators are captured before the HTML guard rejects the response, so
+    // the content type survives to explain what actually arrived.
+    let content_type = done.content_type.as_deref().unwrap_or_default();
+    assert!(
+        content_type.contains("text/html"),
+        "content type was {content_type:?}"
+    );
+}
+
+#[tokio::test]
+async fn redirect_loop_persists_redirect_rejected_category() {
+    let site = FakeSite::spawn().await;
+    let harness = harness("diag-loop", settings_for(&temp_dir("diag-loop-settings")));
+    let record = harness
+        .manager
+        .add_download(&site.url("/redirect/50"), None, Some(&harness.dir), None)
+        .expect("add download");
+    let done = run_to_terminal(&harness, record.id.expect("id")).await;
+
+    assert_eq!(done.state, DownloadState::Failed);
+    assert_eq!(category_of(&done), "redirect_rejected");
+}
+
+#[tokio::test]
+async fn unsafe_redirect_persists_redirect_rejected_category() {
+    let site = FakeSite::spawn().await;
+    let harness = harness("diag-ftp", settings_for(&temp_dir("diag-ftp-settings")));
+    let record = harness
+        .manager
+        .add_download(&site.url("/redirect-ftp"), None, Some(&harness.dir), None)
+        .expect("add download");
+    let done = run_to_terminal(&harness, record.id.expect("id")).await;
+
+    assert_eq!(done.state, DownloadState::Failed);
+    assert_eq!(category_of(&done), "redirect_rejected");
+}
+
+#[tokio::test]
+async fn missing_file_persists_not_found_category() {
+    let site = FakeSite::spawn().await;
+    let harness = harness("diag-404", settings_for(&temp_dir("diag-404-settings")));
+    let record = harness
+        .manager
+        .add_download(&site.url("/status/404"), None, Some(&harness.dir), None)
+        .expect("add download");
+    let done = run_to_terminal(&harness, record.id.expect("id")).await;
+
+    assert_eq!(done.state, DownloadState::Failed);
+    assert_eq!(category_of(&done), "not_found");
+}
+
+#[tokio::test]
+async fn auth_failure_persists_auth_required_category() {
+    let site = FakeSite::spawn().await;
+    let harness = harness("diag-403", settings_for(&temp_dir("diag-403-settings")));
+    let record = harness
+        .manager
+        .add_download(&site.url("/status/403"), None, Some(&harness.dir), None)
+        .expect("add download");
+    let done = run_to_terminal(&harness, record.id.expect("id")).await;
+
+    assert_eq!(done.state, DownloadState::Failed);
+    assert_eq!(category_of(&done), "auth_required");
+}
+
+#[tokio::test]
+async fn checksum_mismatch_persists_checksum_category() {
+    let site = FakeSite::spawn().await;
+    let harness = harness(
+        "diag-checksum",
+        settings_for(&temp_dir("diag-checksum-settings")),
+    );
+    let wrong = "1".repeat(64);
+    let record = harness
+        .manager
+        .add_download(
+            &site.url("/files/data.bin"),
+            None,
+            Some(&harness.dir),
+            Some(&wrong),
+        )
+        .expect("add download");
+    let done = run_to_terminal(&harness, record.id.expect("id")).await;
+
+    assert_eq!(done.state, DownloadState::Failed);
+    assert_eq!(category_of(&done), "checksum_mismatch");
+    assert!(!done.checksum_verified);
+}
+
+#[tokio::test]
+async fn successful_download_clears_the_failure_category() {
+    let site = FakeSite::spawn().await;
+    let harness = harness("diag-clear", settings_for(&temp_dir("diag-clear-settings")));
+    let record = harness
+        .manager
+        .add_download(&site.url("/files/data.bin"), None, Some(&harness.dir), None)
+        .expect("add download");
+    let done = run_to_terminal(&harness, record.id.expect("id")).await;
+
+    assert_eq!(done.state, DownloadState::Completed);
+    assert_eq!(done.failure_category, None);
+}

@@ -7,6 +7,7 @@ use egui::{RichText, Ui};
 use crate::app::backend::{Command, QueueAction};
 use crate::app::state::{Confirmation, Severity, is_active};
 use crate::app::{BulkDownloadApp, components, format, theme};
+use crate::models::diagnostic::{Diagnostic, FailureCategory, host_from_url};
 use crate::models::download_item::DownloadRecord;
 use crate::models::download_status::DownloadState;
 use crate::services::validation::redact_url;
@@ -275,8 +276,56 @@ fn details_panel(app: &mut BulkDownloadApp, ui: &mut Ui) {
                     "Error",
                     record.error_summary.as_deref().unwrap_or(format::DASH),
                 );
+
+                if let Some(category) = record
+                    .failure_category
+                    .as_deref()
+                    .and_then(FailureCategory::parse)
+                {
+                    // Only persisted columns are available here; status,
+                    // redirect count and elapsed time live in the engine's log
+                    // line, so they stay unknown rather than guessed.
+                    let diagnostic = Diagnostic {
+                        download_id: record.id,
+                        host: host_from_url(&record.source_url),
+                        redirect_count: 0,
+                        status: None,
+                        content_type: record.content_type.clone(),
+                        category,
+                        retries: record.retry_count,
+                        elapsed_seconds: 0.0,
+                    };
+                    ui.label(RichText::new("Diagnostics").color(theme::MUTED).size(12.0));
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(category.headline())
+                                .color(category_color(category))
+                                .size(12.0)
+                                .strong(),
+                        );
+                        ui.label(
+                            RichText::new(diagnostic.summary_line())
+                                .color(theme::MUTED)
+                                .size(11.0)
+                                .monospace(),
+                        );
+                    });
+                    ui.end_row();
+                }
             });
     });
+}
+
+/// Severity colour for a failure headline.
+fn category_color(category: FailureCategory) -> egui::Color32 {
+    match category {
+        FailureCategory::Cancelled => theme::MUTED,
+        FailureCategory::Collision
+        | FailureCategory::Timeout
+        | FailureCategory::ServerError
+        | FailureCategory::Network => theme::WARN,
+        _ => theme::ERROR,
+    }
 }
 
 /// Show the file's folder in the platform file manager.

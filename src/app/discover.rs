@@ -144,7 +144,13 @@ pub fn show(app: &mut BulkDownloadApp, ui: &mut Ui) {
                     }
 
                     let name = ui.label(RichText::new(&candidate.filename).color(theme::TEXT));
-                    name.on_hover_text(redact_url(&candidate.candidate_url));
+                    let tooltip = match candidate.anchor_text.as_deref() {
+                        Some(anchor) if !anchor.is_empty() => {
+                            format!("{}\n{}", redact_url(&candidate.candidate_url), anchor)
+                        }
+                        _ => redact_url(&candidate.candidate_url),
+                    };
+                    name.on_hover_text(tooltip);
 
                     ui.label(
                         RichText::new(candidate.extension.as_deref().unwrap_or(format::DASH))
@@ -158,7 +164,15 @@ pub fn show(app: &mut BulkDownloadApp, ui: &mut Ui) {
                             .color(theme::MUTED)
                             .size(12.0),
                     );
-                    if candidate.is_likely_file {
+                    if let Some(reason) = &candidate.filtered_reason {
+                        ui.label(
+                            RichText::new("Filtered")
+                                .color(theme::WARN)
+                                .size(12.0)
+                                .strong(),
+                        )
+                        .on_hover_text(reason);
+                    } else if candidate.is_likely_file {
                         components::badge(ui, "File", theme::SUCCESS);
                     } else {
                         components::badge(ui, "Link", theme::MUTED);
@@ -218,4 +232,36 @@ pub fn show(app: &mut BulkDownloadApp, ui: &mut Ui) {
             }
         }
     });
+
+    if let Some(outcome) = &app.discovery.outcome {
+        ui.add_space(8.0);
+        components::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            components::section_title(ui, "Result");
+            ui.label(
+                RichText::new(format!(
+                    "Queued {} link(s); {} started.",
+                    outcome.added, outcome.started
+                ))
+                .color(if outcome.failed.is_empty() {
+                    theme::SUCCESS
+                } else {
+                    theme::WARN
+                }),
+            );
+            for (url, reason) in outcome.failed.iter().take(8) {
+                ui.label(
+                    RichText::new(format!("✗ {} — {reason}", redact_url(url)))
+                        .color(theme::ERROR)
+                        .size(12.0),
+                );
+            }
+            if outcome.failed.len() > 8 {
+                components::muted(ui, format!("…and {} more.", outcome.failed.len() - 8));
+            }
+            if !outcome.failed.is_empty() {
+                components::muted(ui, format!("{} failure(s) total.", outcome.failed.len()));
+            }
+        });
+    }
 }

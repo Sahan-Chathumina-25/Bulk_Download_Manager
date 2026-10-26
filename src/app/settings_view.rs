@@ -140,6 +140,22 @@ fn discovery_card(app: &mut BulkDownloadApp, ui: &mut Ui) {
             &mut app.settings_state.draft.respect_rate_limit,
             "Respect server rate limits",
         );
+        ui.checkbox(
+            &mut app.settings_state.draft.ad_filter_enabled,
+            "Filter ad and tracker hosts while scanning",
+        );
+
+        ui.add_space(6.0);
+        ui.label(RichText::new("Custom filter list (hosts format)").color(theme::MUTED));
+        ui.add(
+            egui::TextEdit::singleline(&mut app.settings_state.draft.ad_filter_list_path)
+                .desired_width(f32::INFINITY)
+                .hint_text("e.g. adblock-hosts.txt"),
+        );
+        components::muted(
+            ui,
+            "The built-in list always applies. An unreadable custom list is reported and ignored.",
+        );
 
         ui.add_space(6.0);
         ui.label(RichText::new("Allowed extensions").color(theme::MUTED));
