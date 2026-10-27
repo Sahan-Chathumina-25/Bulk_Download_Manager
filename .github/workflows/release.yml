@@ -86,7 +86,7 @@ jobs:
 
   publish:
     name: Publish GitHub release
-    needs: build
+    needs: [validate, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -96,6 +96,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: release-assets
+          merge-multiple: true
       - name: Create release and upload assets
         uses: ncipollo/release-action@v1
         with:
