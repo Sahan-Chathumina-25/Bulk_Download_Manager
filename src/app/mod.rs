@@ -37,6 +37,10 @@ pub mod theme;
 const NAV_WIDTH: f32 = 220.0;
 /// Bottom status bar height.
 const STATUS_HEIGHT: f32 = 30.0;
+/// Margin between the window edge and the floating glass panel.
+const PANEL_MARGIN: f32 = 14.0;
+/// Corner radius of the floating glass panel.
+const PANEL_RADIUS: u8 = 18;
 /// Maximum width of the page content column; wider windows centre it.
 const CONTENT_MAX_WIDTH: f32 = 1180.0;
 
@@ -385,9 +389,9 @@ impl BulkDownloadApp {
     }
 
     fn nav(&mut self, ui: &mut Ui) {
+        // The rail background is painted by the shell so it can follow the
+        // panel's rounded corners.
         let palette = theme::palette(ui);
-        ui.painter()
-            .rect_filled(ui.max_rect(), CornerRadius::ZERO, palette.sidebar);
 
         ui.add_space(theme::SPACE_5);
         ui.horizontal(|ui| {
@@ -434,10 +438,15 @@ impl BulkDownloadApp {
             }
         }
 
-        let active = self.active_count();
+        let counts = self.queue.activity_counts();
         let connected = self.events_connected;
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.add_space(theme::SPACE_3);
+            ui.horizontal(|ui| {
+                ui.add_space(theme::SPACE_3);
+                activity_summary(ui, counts, palette);
+            });
+            ui.add_space(theme::SPACE_2);
             ui.horizontal(|ui| {
                 ui.add_space(theme::SPACE_4);
                 let (rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
@@ -457,23 +466,15 @@ impl BulkDownloadApp {
                     .color(palette.text_secondary),
                 );
             });
-            ui.horizontal(|ui| {
-                ui.add_space(theme::SPACE_4);
-                ui.label(
-                    RichText::new(format!("{active} active · {queued} queued"))
-                        .size(theme::SMALL_SIZE)
-                        .color(palette.muted),
-                );
-            });
             ui.add_space(theme::SPACE_2);
             separator(ui, palette);
         });
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {
+        // The strip background is painted by the shell so it can follow the
+        // panel's rounded corners.
         let palette = theme::palette(ui);
-        ui.painter()
-            .rect_filled(ui.max_rect(), CornerRadius::ZERO, palette.sidebar);
         let active = self.active_count();
         let queued = self.queue.len();
         let state = if active > 0 {
@@ -485,12 +486,16 @@ impl BulkDownloadApp {
         };
 
         ui.horizontal_centered(|ui| {
+            ui.add_space(theme::SPACE_4);
             ui.label(
                 RichText::new(format!("{} — {}", self.page.title(), state))
                     .size(theme::SMALL_SIZE)
                     .color(palette.muted),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Keep the rightmost label off the panel edge; the clip rect
+                // sits a few pixels inside the rounded silhouette.
+                ui.add_space(theme::SPACE_4);
                 ui.label(
                     RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
                         .size(theme::SMALL_SIZE)
@@ -530,8 +535,9 @@ impl BulkDownloadApp {
             return;
         };
 
+        let palette = theme::palette(ui);
         ui.painter()
-            .rect_filled(full, CornerRadius::ZERO, Color32::from_black_alpha(160));
+            .rect_filled(full, CornerRadius::ZERO, palette.modal_scrim);
 
         let width = 460.0;
         let rect = Rect::from_center_size(full.center(), vec2(width, 230.0));
@@ -654,6 +660,133 @@ impl BulkDownloadApp {
     }
 }
 
+/// Compact live activity summary for the bottom of the navigation rail.
+///
+/// Counts come from [`state::QueueState::activity_counts`], the same rows the
+/// Queue page renders; zero categories are omitted and an all-zero queue reads
+/// as idle.
+fn activity_summary(ui: &mut Ui, counts: state::ActivityCounts, palette: theme::Palette) {
+    components::glass_panel(ui, components::GlassLevel::Secondary)
+        .inner_margin(Margin::symmetric(
+            theme::SPACE_2 as i8,
+            theme::SPACE_2 as i8,
+        ))
+        .corner_radius(theme::RADIUS_INPUT)
+        .without_shadow()
+        .show(ui, |ui| {
+            ui.set_width(NAV_WIDTH - 2.0 * theme::SPACE_3 - 2.0 * theme::SPACE_2);
+            ui.spacing_mut().item_spacing.y = 2.0;
+
+            if counts.active == 0 && counts.queued == 0 && counts.failed == 0 {
+                activity_row(ui, palette.muted, "Idle", palette.muted);
+                return;
+            }
+            if counts.active > 0 {
+                activity_row(
+                    ui,
+                    palette.cyan,
+                    &format!("{} active", counts.active),
+                    palette.text_secondary,
+                );
+            }
+            if counts.queued > 0 {
+                activity_row(
+                    ui,
+                    palette.warning,
+                    &format!("{} queued", counts.queued),
+                    palette.text_secondary,
+                );
+            }
+            if counts.failed > 0 {
+                activity_row(
+                    ui,
+                    palette.error,
+                    &format!("{} failed", counts.failed),
+                    palette.text_secondary,
+                );
+            }
+        });
+}
+
+/// One dot-plus-count row inside the activity summary.
+fn activity_row(ui: &mut Ui, dot: Color32, text: &str, text_color: Color32) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+        ui.painter().circle_filled(rect.center(), 3.5, dot);
+        ui.label(
+            RichText::new(text)
+                .size(theme::SMALL_SIZE)
+                .color(text_color),
+        );
+    });
+}
+
+/// Concentric falloff rings per ambient blob: size multiplier and the share of
+/// the blob's alpha it carries. The widest ring is the faintest, so the blob
+/// fades into the background instead of ending on a visible contour. Six rings
+/// keep the per-step delta below ~2% alpha, which reads as a smooth glow.
+const AMBIENT_RINGS: [(f32, f32); 6] = [
+    (1.62, 0.08),
+    (1.44, 0.12),
+    (1.26, 0.15),
+    (1.08, 0.19),
+    (0.90, 0.21),
+    (0.72, 0.25),
+];
+
+/// Static ambient glass wash painted across the whole window.
+///
+/// The large corner blobs are fixed in place, low-alpha and painted once per
+/// frame; the floating panel and every card on top are opaque enough that
+/// readability never depends on them.
+fn paint_ambient_background(painter: &egui::Painter, rect: Rect, palette: theme::Palette) {
+    let painter = painter.with_clip_rect(rect);
+    let width = rect.width();
+    let height = rect.height();
+    let blobs = [
+        // Indigo wash anchored to the top-left corner.
+        (
+            egui::pos2(rect.left() + width * 0.10, rect.top() + height * 0.02),
+            egui::vec2(width * 1.05, height * 0.85),
+            palette.ambient_indigo,
+            76,
+        ),
+        // Violet wash anchored to the top-right corner.
+        (
+            egui::pos2(rect.right() - width * 0.02, rect.top() + height * 0.12),
+            egui::vec2(width * 0.90, height * 0.95),
+            palette.ambient_violet,
+            72,
+        ),
+        // Cyan wash along the bottom-left corner.
+        (
+            egui::pos2(rect.left() + width * 0.04, rect.bottom() - height * 0.02),
+            egui::vec2(width * 0.80, height * 0.65),
+            palette.ambient_cyan,
+            52,
+        ),
+        // Cyan wash along the bottom-right corner.
+        (
+            egui::pos2(rect.right() - width * 0.02, rect.bottom() - height * 0.01),
+            egui::vec2(width * 0.70, height * 0.55),
+            palette.ambient_cyan,
+            44,
+        ),
+    ];
+
+    for (center, size, color, alpha) in blobs {
+        for (scale, share) in AMBIENT_RINGS {
+            let ring_alpha = (alpha as f32 * share).round().clamp(1.0, 255.0) as u8;
+            let fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), ring_alpha);
+            painter.rect_filled(
+                Rect::from_center_size(center, size * scale),
+                CornerRadius::same(255),
+                fill,
+            );
+        }
+    }
+}
+
 /// A one-pixel hairline across the current UI.
 fn separator(ui: &mut Ui, palette: theme::Palette) {
     let rect = ui.available_rect_before_wrap();
@@ -728,7 +861,7 @@ fn nav_item(
             Align2::CENTER_CENTER,
             badge,
             FontId::proportional(10.0),
-            Color32::WHITE,
+            palette.on_accent,
         );
     }
 
@@ -893,24 +1026,89 @@ impl eframe::App for BulkDownloadApp {
         // inset from the framebuffer, which used to leave an unpainted band
         // below the status strip.
         let full = ui.ctx().content_rect();
-        ui.painter()
-            .rect_filled(full, CornerRadius::ZERO, theme::BG);
+        let palette = theme::palette(ui);
 
-        let nav_rect = Rect::from_min_size(full.min, egui::vec2(NAV_WIDTH, full.height()));
-        let page_rect = Rect::from_min_size(
-            egui::pos2(full.left() + NAV_WIDTH, full.top()),
-            egui::vec2(full.width() - NAV_WIDTH, full.height() - STATUS_HEIGHT),
+        // The window is the deep navy field; the ambient wash spans all of it
+        // so the glow stays visible in the margin around the floating panel.
+        ui.painter()
+            .rect_filled(full, CornerRadius::ZERO, palette.bg);
+        paint_ambient_background(ui.painter(), full, palette);
+
+        // Floating glass panel, inset from the window edges.
+        let panel = full.shrink(PANEL_MARGIN);
+        let panel_radius = CornerRadius::same(PANEL_RADIUS);
+        // A tight shadow keeps the ambient glow visible in the outer margin.
+        for (spread, alpha) in [(7.0_f32, 16_u8), (2.0, 26)] {
+            let radius = (f32::from(PANEL_RADIUS) + spread * 0.5).round() as u8;
+            ui.painter().rect_filled(
+                panel.expand(spread).translate(vec2(0.0, 3.0)),
+                CornerRadius::same(radius),
+                Color32::from_black_alpha(alpha),
+            );
+        }
+        // Slight translucency lets the ambient field tint the glass edges while
+        // every card on top stays opaque.
+        let panel_fill = Color32::from_rgba_unmultiplied(
+            palette.surface.r(),
+            palette.surface.g(),
+            palette.surface.b(),
+            220,
+        );
+        ui.painter().rect_filled(panel, panel_radius, panel_fill);
+        ui.painter().rect_stroke(
+            panel,
+            panel_radius,
+            Stroke::new(1.0, palette.border),
+            egui::StrokeKind::Inside,
+        );
+
+        let nav_rect = Rect::from_min_size(
+            panel.min,
+            egui::vec2(NAV_WIDTH, panel.height() - STATUS_HEIGHT),
+        );
+        let page_rect = Rect::from_min_max(
+            egui::pos2(panel.left() + NAV_WIDTH, panel.top()),
+            egui::pos2(panel.right(), panel.bottom() - STATUS_HEIGHT),
         );
         let status_rect = Rect::from_min_size(
-            egui::pos2(full.left(), full.bottom() - STATUS_HEIGHT),
-            egui::vec2(full.width(), STATUS_HEIGHT),
+            egui::pos2(panel.left(), panel.bottom() - STATUS_HEIGHT),
+            egui::vec2(panel.width(), STATUS_HEIGHT),
         );
 
+        // Darker rail and status strips inside the panel. They carry the
+        // panel's radius only on the outer corners.
+        ui.painter().rect_filled(
+            nav_rect,
+            CornerRadius {
+                nw: PANEL_RADIUS,
+                sw: PANEL_RADIUS,
+                ne: 0,
+                se: 0,
+            },
+            palette.sidebar,
+        );
+        ui.painter().rect_filled(
+            status_rect,
+            CornerRadius {
+                nw: 0,
+                ne: 0,
+                sw: PANEL_RADIUS,
+                se: PANEL_RADIUS,
+            },
+            palette.sidebar,
+        );
+
+        // egui clip rects are rectangular, so shrink past the rounded corners;
+        // the panel fill already provides the rounded silhouette.
+        let clip = panel.shrink(3.0);
+
         ui.scope_builder(UiBuilder::new().max_rect(nav_rect), |ui| {
+            ui.set_clip_rect(clip);
             self.nav(ui);
         });
 
         ui.scope_builder(UiBuilder::new().max_rect(page_rect), |ui| {
+            ui.set_clip_rect(clip);
             egui::Frame::new()
                 .inner_margin(Margin::symmetric(
                     theme::SPACE_6 as i8,
@@ -939,11 +1137,12 @@ impl eframe::App for BulkDownloadApp {
         });
 
         ui.scope_builder(UiBuilder::new().max_rect(status_rect), |ui| {
+            ui.set_clip_rect(clip);
             self.status_bar(ui);
         });
 
-        self.toasts(ui, full);
-        self.render_confirmation(ui, page_rect);
+        self.toasts(ui, panel);
+        self.render_confirmation(ui, full);
         self.mark_tick(now);
         self.schedule_repaint(&ctx);
     }

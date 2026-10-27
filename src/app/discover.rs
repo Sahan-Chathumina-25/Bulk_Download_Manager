@@ -63,10 +63,11 @@ fn classify(candidate: &DiscoveryCandidate, palette: Palette) -> Classification 
 }
 
 pub fn show(app: &mut BulkDownloadApp, ui: &mut Ui) {
-    components::page_heading(
+    components::page_header(
         ui,
         "Discover",
-        "Scan a page for links, tick the files you want, then queue them.",
+        "Scan a webpage for downloadable links",
+        None,
     );
 
     scan_card(app, ui);
@@ -343,45 +344,54 @@ fn candidates_card(app: &mut BulkDownloadApp, ui: &mut Ui) {
                                 .on_hover_text(content_type);
                             }
 
-                            ui.vertical(|ui| {
-                                components::ellipsized_label(
-                                    ui,
-                                    RichText::new(&candidate.filename)
-                                        .size(theme::BODY_SIZE)
-                                        .color(name_color),
-                                    &tooltip,
-                                );
-
-                                ui.horizontal_wrapped(|ui| {
-                                    let host = host_from_url(&candidate.candidate_url);
-                                    components::muted(
-                                        ui,
-                                        if host.is_empty() {
-                                            "unknown host".to_string()
-                                        } else {
-                                            host
-                                        },
-                                    );
-                                    components::status_badge(ui, class.label, class.color);
-
-                                    let extension = candidate
-                                        .extension
-                                        .as_deref()
-                                        .map(str::to_uppercase)
-                                        .unwrap_or_else(|| "UNKNOWN".to_string());
-                                    components::muted(ui, extension);
-
-                                    if let Some(reason) = &candidate.filtered_reason {
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.vertical(|ui| {
                                         components::ellipsized_label(
                                             ui,
-                                            RichText::new(reason)
-                                                .size(theme::SMALL_SIZE)
-                                                .color(palette.muted),
-                                            reason,
+                                            RichText::new(&candidate.filename)
+                                                .size(theme::BODY_SIZE)
+                                                .color(name_color),
+                                            &tooltip,
                                         );
-                                    }
-                                });
-                            });
+
+                                        ui.horizontal_wrapped(|ui| {
+                                            let host = host_from_url(&candidate.candidate_url);
+                                            components::muted(
+                                                ui,
+                                                if host.is_empty() {
+                                                    "unknown host".to_string()
+                                                } else {
+                                                    host
+                                                },
+                                            );
+                                            components::status_badge(
+                                                ui,
+                                                class.label,
+                                                class.color,
+                                            );
+
+                                            let extension = candidate
+                                                .extension
+                                                .as_deref()
+                                                .map(str::to_uppercase)
+                                                .unwrap_or_else(|| "UNKNOWN".to_string());
+                                            components::muted(ui, extension);
+
+                                            if let Some(reason) = &candidate.filtered_reason {
+                                                components::ellipsized_label(
+                                                    ui,
+                                                    RichText::new(reason)
+                                                        .size(theme::SMALL_SIZE)
+                                                        .color(palette.muted),
+                                                    reason,
+                                                );
+                                            }
+                                        });
+                                    });
+                                },
+                            );
                         },
                     );
                 });

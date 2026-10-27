@@ -15,18 +15,17 @@ const SECTION_LIMIT: usize = 5;
 
 pub fn show(app: &mut BulkDownloadApp, ui: &mut Ui) {
     let palette = theme::palette(ui);
+    if components::page_header(
+        ui,
+        "Dashboard",
+        "Live overview of everything in progress",
+        Some("Add Downloads"),
+    ) {
+        app.navigate_to(Page::AddDownloads);
+    }
+
     ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            components::page_heading(
-                ui,
-                "Dashboard",
-                "What is happening now, and what needs attention.",
-            );
-        });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if components::button(ui, "Add Downloads", Action::Primary).clicked() {
-                app.navigate_to(Page::AddDownloads);
-            }
             if components::button(ui, "Refresh", Action::Secondary).clicked() {
                 app.send(Command::RefreshDashboard);
             }
@@ -40,20 +39,40 @@ pub fn show(app: &mut BulkDownloadApp, ui: &mut Ui) {
 
     let stats = app.dashboard.stats;
     ui.horizontal_wrapped(|ui| {
-        components::stat_tile(ui, "Active", stats.active.to_string(), palette.accent);
+        components::stat_tile(
+            ui,
+            "Active",
+            stats.active.to_string(),
+            palette.accent,
+            Some(|| app.navigate_to(Page::Queue)),
+        );
         components::stat_tile(
             ui,
             "Queued",
             stats.queued.to_string(),
             palette.text_secondary,
+            Some(|| app.navigate_to(Page::Queue)),
         );
         components::stat_tile(
             ui,
             "Completed",
             stats.completed.to_string(),
             palette.success,
+            Some(|| {
+                app.history.set_state_filter(Some(DownloadState::Completed));
+                app.navigate_to(Page::History);
+            }),
         );
-        components::stat_tile(ui, "Failed", stats.failed.to_string(), palette.error);
+        components::stat_tile(
+            ui,
+            "Failed",
+            stats.failed.to_string(),
+            palette.error,
+            Some(|| {
+                app.history.set_state_filter(Some(DownloadState::Failed));
+                app.navigate_to(Page::History);
+            }),
+        );
     });
 
     ui.add_space(theme::SPACE_3);
@@ -115,21 +134,25 @@ fn active_section(app: &mut BulkDownloadApp, ui: &mut Ui) {
                         components::status_badge(
                             ui,
                             theme::state_label(record.state),
-                            theme::state_color(record.state),
+                            palette.state_color(record.state),
                         );
-                        components::ellipsized_label(
-                            ui,
-                            RichText::new(&record.display_name)
-                                .size(theme::BODY_SIZE)
-                                .color(palette.text),
-                            &redact_url(&record.source_url),
-                        );
+                        // The name takes the remaining width from the left so it
+                        // reads like a row title, not a right-aligned caption.
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            components::ellipsized_label(
+                                ui,
+                                RichText::new(&record.display_name)
+                                    .size(theme::BODY_SIZE)
+                                    .color(palette.text),
+                                &redact_url(&record.source_url),
+                            );
+                        });
                     });
                 });
                 components::progress_bar(
                     ui,
                     view.fraction,
-                    theme::state_color(record.state),
+                    palette.state_color(record.state),
                     ui.available_width(),
                 );
                 let total = match view.total_bytes {
@@ -192,12 +215,17 @@ fn attention_section(app: &mut BulkDownloadApp, ui: &mut Ui, palette: theme::Pal
                     ui.horizontal(|ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             components::status_badge(ui, "Failed", palette.error);
-                            components::ellipsized_label(
-                                ui,
-                                RichText::new(&record.display_name)
-                                    .size(theme::BODY_SIZE)
-                                    .color(palette.text),
-                                &redact_url(&record.source_url),
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    components::ellipsized_label(
+                                        ui,
+                                        RichText::new(&record.display_name)
+                                            .size(theme::BODY_SIZE)
+                                            .color(palette.text),
+                                        &redact_url(&record.source_url),
+                                    );
+                                },
                             );
                         });
                     });
@@ -285,15 +313,17 @@ fn recent_section(app: &mut BulkDownloadApp, ui: &mut Ui) {
                         components::status_badge(
                             ui,
                             theme::state_label(record.state),
-                            theme::state_color(record.state),
+                            palette.state_color(record.state),
                         );
-                        components::ellipsized_label(
-                            ui,
-                            RichText::new(&record.display_name)
-                                .size(theme::BODY_SIZE)
-                                .color(palette.text),
-                            &redact_url(&record.source_url),
-                        );
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            components::ellipsized_label(
+                                ui,
+                                RichText::new(&record.display_name)
+                                    .size(theme::BODY_SIZE)
+                                    .color(palette.text),
+                                &redact_url(&record.source_url),
+                            );
+                        });
                     });
                 });
             });

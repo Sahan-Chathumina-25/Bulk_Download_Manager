@@ -3,7 +3,7 @@
 use egui::{RichText, Ui};
 
 use crate::app::backend::Command;
-use crate::app::state::Severity;
+use crate::app::state::{Page, Severity};
 use crate::app::theme::Action;
 use crate::app::{BulkDownloadApp, components, theme};
 use crate::services::validation::redact_url;
@@ -18,10 +18,11 @@ const EDITOR_HELP: &str = "One URL per line. A second tab-separated column is ig
 
 pub fn show(app: &mut BulkDownloadApp, ui: &mut Ui) {
     let palette = theme::palette(ui);
-    components::page_heading(
+    components::page_header(
         ui,
         "Add Downloads",
-        "Paste URLs or import a text file, choose a destination, then queue them.",
+        "Paste links and queue them for download",
+        None,
     );
 
     track_single_url(app);
@@ -67,11 +68,14 @@ pub fn show(app: &mut BulkDownloadApp, ui: &mut Ui) {
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add_enabled_ui(can_add && !app.add.add_pending, |ui| {
-                if components::button(ui, "Add to Queue", Action::Add).clicked() {
-                    submit(app);
-                }
-            });
+            ui.add_enabled_ui(
+                can_add && !app.add.add_pending && !app.add.preview_pending,
+                |ui| {
+                    if components::button(ui, "Add to Queue", Action::Add).clicked() {
+                        submit(app);
+                    }
+                },
+            );
             ui.add_space(theme::SPACE_2);
             ui.checkbox(&mut app.add.start_immediately, "Start immediately");
         });
@@ -247,7 +251,7 @@ pub fn show(app: &mut BulkDownloadApp, ui: &mut Ui) {
         });
     }
 
-    if let Some(outcome) = &app.add.outcome {
+    if let Some(outcome) = app.add.outcome.clone() {
         ui.add_space(theme::SPACE_2);
         components::card_for(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -258,11 +262,17 @@ pub fn show(app: &mut BulkDownloadApp, ui: &mut Ui) {
             } else {
                 palette.warning
             };
-            components::status_badge(
-                ui,
-                &format!("{} added · {} started", outcome.added, outcome.started),
-                accent,
-            );
+            ui.horizontal(|ui| {
+                components::status_badge(
+                    ui,
+                    &format!("{} added · {} started", outcome.added, outcome.started),
+                    accent,
+                );
+                if outcome.added > 0 && components::button(ui, "Open Queue", Action::Info).clicked()
+                {
+                    app.navigate_to(Page::Queue);
+                }
+            });
 
             if !outcome.failed.is_empty() {
                 ui.add_space(theme::SPACE_2);

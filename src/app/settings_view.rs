@@ -21,10 +21,11 @@ pub fn show(app: &mut BulkDownloadApp, ui: &mut Ui) {
     // The shell already scrolls the page column; a nested vertical scroll area
     // here collapses the body, so the page only contributes its content.
     ui.set_width(ui.available_width());
-    components::page_heading(
+    components::page_header(
         ui,
         "Settings",
-        "Preferences are stored in the local database. Theme previews immediately; every other change is saved with Save settings.",
+        "Configure destinations, network, and appearance",
+        None,
     );
 
     startup_banner(app, ui, palette);
@@ -139,7 +140,7 @@ fn appearance_card(app: &mut BulkDownloadApp, ui: &mut Ui, palette: Palette) {
         }
         components::muted(
             ui,
-            "Dark and Light use the Midnight Indigo palettes. System follows the OS preference and falls back to Dark when the platform does not report one.",
+            "Dark glass is the primary theme. Light uses the matching palette. System follows the OS preference and falls back to Dark glass when the platform does not report one.",
         );
         components::muted(ui, "The preview is immediate; Save persists the choice.");
 
@@ -434,7 +435,7 @@ fn collision_hint(policy: CollisionPolicy) -> &'static str {
 
 fn theme_label(theme: Theme) -> &'static str {
     match theme {
-        Theme::Dark => "Dark",
+        Theme::Dark => "Dark glass",
         Theme::Light => "Light",
         Theme::System => "System (follow OS)",
     }

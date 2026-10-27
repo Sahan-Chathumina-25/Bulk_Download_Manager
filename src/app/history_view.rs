@@ -12,10 +12,11 @@ use crate::services::validation::redact_url;
 
 pub fn show(app: &mut BulkDownloadApp, ui: &mut Ui) {
     let palette = theme::palette(ui);
-    components::page_heading(
+    components::page_header(
         ui,
         "History",
-        "Completed, failed, cancelled and interrupted downloads.",
+        "Completed and failed downloads, searchable",
+        None,
     );
 
     toolbar(app, ui, palette);

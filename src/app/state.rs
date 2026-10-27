@@ -81,6 +81,14 @@ pub struct ProgressView {
     pub fraction: Option<f32>,
 }
 
+/// Activity summary derived from the same live rows the queue page renders.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ActivityCounts {
+    pub active: usize,
+    pub queued: usize,
+    pub failed: usize,
+}
+
 /// Live queue rows plus the ephemeral progress snapshots that decorate them.
 ///
 /// Progress is kept outside [`DownloadRecord`] because the engine throttles it
@@ -109,6 +117,23 @@ impl QueueState {
 
     pub fn len(&self) -> usize {
         self.records.len()
+    }
+
+    /// Real activity counts for the navigation rail summary.
+    pub fn activity_counts(&self) -> ActivityCounts {
+        let mut counts = ActivityCounts::default();
+        for record in &self.records {
+            match record.state {
+                DownloadState::Connecting | DownloadState::Downloading => counts.active += 1,
+                DownloadState::Queued => counts.queued += 1,
+                DownloadState::Failed => counts.failed += 1,
+                DownloadState::Paused
+                | DownloadState::Completed
+                | DownloadState::Cancelled
+                | DownloadState::Interrupted => {}
+            }
+        }
+        counts
     }
 
     /// Replace the whole row set (initial load / refresh).
@@ -568,7 +593,7 @@ impl AddDownloadsState {
 ///
 /// Counts rather than records: the UI only needs the headline numbers and the
 /// per-URL failure reasons, and the queue refreshes itself from the backend.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct AddOutcome {
     pub added: usize,
     pub failed: Vec<(String, String)>,

@@ -13,11 +13,6 @@ use crate::models::download_item::DownloadRecord;
 use crate::models::download_status::DownloadState;
 use crate::services::validation::redact_url;
 
-/// Copy for a bulk action that needs a selection.
-fn no_selection(action: &str) -> String {
-    format!("Select one or more queue rows first to {action}.")
-}
-
 /// One per-row control the page can issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowAction {
@@ -30,7 +25,12 @@ enum RowAction {
 
 pub fn show(app: &mut BulkDownloadApp, ui: &mut Ui) {
     let palette = theme::palette(ui);
-    components::page_heading(ui, "Queue", "Live downloads, oldest first.");
+    components::page_header(
+        ui,
+        "Queue",
+        "Every download, its state, and its controls",
+        None,
+    );
 
     ui.horizontal(|ui| {
         if components::button(ui, "Start all", Action::Start).clicked() {
@@ -57,13 +57,41 @@ pub fn show(app: &mut BulkDownloadApp, ui: &mut Ui) {
 }
 
 /// Bulk actions that operate on the current tick selection.
+///
+/// Every control is enabled only for the states it can actually act on, so a
+/// bulk click can never turn into a no-op or an error.
 fn bulk_toolbar(app: &mut BulkDownloadApp, ui: &mut Ui) {
     let palette = theme::palette(ui);
     components::card_for(ui).show(ui, |ui| {
         ui.set_width(ui.available_width());
+
+        let selected = app.queue.selected_ids();
+        let has_selection = !selected.is_empty();
+        let mut can_pause = false;
+        let mut can_resume = false;
+        let mut failed: Vec<i64> = Vec::new();
+        for record in app.queue.records() {
+            let Some(id) = record.id else {
+                continue;
+            };
+            if !selected.contains(&id) {
+                continue;
+            }
+            match record.state {
+                DownloadState::Connecting | DownloadState::Downloading => can_pause = true,
+                DownloadState::Queued | DownloadState::Paused | DownloadState::Interrupted => {
+                    can_resume = true;
+                }
+                DownloadState::Failed => failed.push(id),
+                DownloadState::Completed | DownloadState::Cancelled => {}
+            }
+        }
+        // Retry is only truthful when every selected row is a failed one.
+        let can_retry = !failed.is_empty() && failed.len() == selected.len();
+
         ui.horizontal_wrapped(|ui| {
             components::section_heading(ui, "Selected");
-            let selected_count = app.queue.selected_ids().len();
+            let selected_count = selected.len();
             components::status_badge(
                 ui,
                 &format!("{selected_count} selected"),
@@ -74,80 +102,59 @@ fn bulk_toolbar(app: &mut BulkDownloadApp, ui: &mut Ui) {
                 },
             );
 
-            let selected = app.queue.selected_ids();
-            if components::button(ui, "Pause", Action::Pause).clicked() {
-                if selected.is_empty() {
-                    app.toast(Severity::Info, no_selection("pause"));
-                } else {
+            ui.add_enabled_ui(can_pause, |ui| {
+                if components::button(ui, "Pause", Action::Pause).clicked() {
                     app.send(Command::QueueAction {
-                        ids: selected,
+                        ids: selected.clone(),
                         action: QueueAction::Pause,
                     });
                 }
-            }
+            });
 
-            let selected = app.queue.selected_ids();
-            if components::button(ui, "Resume", Action::Start).clicked() {
-                if selected.is_empty() {
-                    app.toast(Severity::Info, no_selection("resume"));
-                } else {
+            ui.add_enabled_ui(can_resume, |ui| {
+                if components::button(ui, "Resume", Action::Start).clicked() {
                     app.send(Command::QueueAction {
-                        ids: selected,
+                        ids: selected.clone(),
                         action: QueueAction::Resume,
                     });
                 }
-            }
+            });
 
-            let selected = app.queue.selected_ids();
-            if components::button(ui, "Retry", Action::Retry).clicked() {
-                let failed: Vec<i64> = app
-                    .queue
-                    .records()
-                    .iter()
-                    .filter(|record| {
-                        record.state == DownloadState::Failed
-                            && record.id.is_some_and(|id| selected.contains(&id))
-                    })
-                    .filter_map(|record| record.id)
-                    .collect();
-                if selected.is_empty() {
-                    app.toast(Severity::Info, no_selection("retry"));
-                } else if failed.len() != selected.len() {
-                    app.toast(
-                        Severity::Info,
-                        "Retry applies to failed downloads only. Select FAILED rows and try again.",
-                    );
-                } else {
+            ui.add_enabled_ui(can_retry, |ui| {
+                if components::button(ui, "Retry", Action::Retry).clicked() {
                     app.send(Command::QueueAction {
-                        ids: failed,
+                        ids: failed.clone(),
                         action: QueueAction::Retry,
                     });
                 }
-            }
+            });
 
-            let selected = app.queue.selected_ids();
-            if components::button(ui, "Cancel…", Action::Cancel).clicked() {
-                if selected.is_empty() {
-                    app.toast(Severity::Info, no_selection("cancel"));
-                } else {
-                    app.confirm(Confirmation::CancelQueue { ids: selected });
+            ui.add_enabled_ui(has_selection, |ui| {
+                if components::button(ui, "Cancel…", Action::Cancel).clicked() {
+                    app.confirm(Confirmation::CancelQueue {
+                        ids: selected.clone(),
+                    });
                 }
-            }
+            });
 
-            let selected = app.queue.selected_ids();
-            if components::button(ui, "Remove…", Action::Failed).clicked() {
-                if selected.is_empty() {
-                    app.toast(Severity::Info, no_selection("remove"));
-                } else {
-                    app.confirm(Confirmation::RemoveQueue { ids: selected });
+            ui.add_enabled_ui(has_selection, |ui| {
+                if components::button(ui, "Remove…", Action::Failed).clicked() {
+                    app.confirm(Confirmation::RemoveQueue {
+                        ids: selected.clone(),
+                    });
                 }
-            }
+            });
         });
 
-        if app.queue.selected_ids().is_empty() {
+        if !has_selection {
             components::muted(
                 ui,
                 "Tick a row for bulk actions. The buttons on each row work without a selection.",
+            );
+        } else if !can_pause && !can_resume && failed.is_empty() {
+            components::muted(
+                ui,
+                "The selected rows are already settled; use a per-row control or remove them.",
             );
         }
     });
@@ -214,30 +221,34 @@ fn queue_row(app: &mut BulkDownloadApp, ui: &mut Ui, record: &DownloadRecord, pa
                 components::status_badge(ui, theme::state_label(state), color);
                 row_actions(ui, record, palette, &mut action);
 
-                ui.vertical(|ui| {
-                    components::ellipsized_label(
-                        ui,
-                        RichText::new(&record.display_name)
-                            .size(theme::BODY_SIZE)
-                            .color(palette.text),
-                        &redact_url(&record.source_url),
-                    );
+                // Name and metadata read from the left edge; only the state
+                // badge and controls are pinned to the right.
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.vertical(|ui| {
+                        components::ellipsized_label(
+                            ui,
+                            RichText::new(&record.display_name)
+                                .size(theme::BODY_SIZE)
+                                .color(palette.text),
+                            &redact_url(&record.source_url),
+                        );
 
-                    ui.horizontal_wrapped(|ui| {
-                        if !host.is_empty() {
-                            components::muted(ui, host.clone());
-                        }
-                        components::muted(ui, size_text(&view));
-                        if is_active(state) && view.speed_bps > 0.0 {
-                            components::muted(
-                                ui,
-                                format!(
-                                    "· {} · ETA {}",
-                                    format::format_speed(Some(view.speed_bps)),
-                                    format::format_eta(view.eta_seconds)
-                                ),
-                            );
-                        }
+                        ui.horizontal_wrapped(|ui| {
+                            if !host.is_empty() {
+                                components::muted(ui, host.clone());
+                            }
+                            components::muted(ui, size_text(&view));
+                            if is_active(state) && view.speed_bps > 0.0 {
+                                components::muted(
+                                    ui,
+                                    format!(
+                                        "· {} · ETA {}",
+                                        format::format_speed(Some(view.speed_bps)),
+                                        format::format_eta(view.eta_seconds)
+                                    ),
+                                );
+                            }
+                        });
                     });
                 });
             });
