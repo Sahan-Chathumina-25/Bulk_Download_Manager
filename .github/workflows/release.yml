@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g., 1.0.0 or v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.normalize.outputs.version }}
+    steps:
+      - name: Normalize version
+        id: normalize
+        run: |
+          VERSION="${{ inputs.version }}"
+          VERSION="${VERSION#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: Version must be in semver format"
+            exit 1
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+  bump-version:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update version files
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          # Cargo.toml: the first ^version line is the [package] version
+          sed -i -E '0,/^version = ".*"$/s//version = "'"$VERSION"'"/' Cargo.toml
+          # Cargo.lock: the version line immediately after the workspace member's name entry
+          awk -v v="$VERSION" '
+            /^name = "BulkDownloadManager"$/ && !done {
+              print; getline;
+              sub(/^version = ".*"$/, "version = \"" v "\"");
+              print; done=1; next
+            }
+            { print }
+          ' Cargo.lock > Cargo.lock.tmp && mv Cargo.lock.tmp Cargo.lock
+          echo "--- Cargo.toml ---"
+          grep -n "^version" Cargo.toml
+          echo "--- Cargo.lock ---"
+          grep -A1 '^name = "BulkDownloadManager"' Cargo.lock
+      - name: Commit version bump
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git diff --cached --quiet || git commit -m "chore(release): v${{ needs.validate.outputs.version }}"
+          git push origin HEAD
+          echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+
+  build:
+    needs: [validate, bump-version]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump-version.outputs.sha }}
+      - name: Build
+        run: cargo build --release
+      - name: Package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/release/BulkDownloadManager.exe -DestinationPath "BulkDownloadManager-${{ needs.validate.outputs.version }}-windows-x64.zip"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-windows
+          path: BulkDownloadManager-*-windows-x64.zip
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+      - name: Create release and upload assets
+        uses: ncipollo/release-action@v1
+        with:
+          tag: v${{ needs.validate.outputs.version }}
+          name: BulkDownloadManager v${{ needs.validate.outputs.version }}
+          artifacts: "release-assets/**/*"
+          generateReleaseNotes: true
+          allowUpdates: true
+          draft: false
+          prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}
