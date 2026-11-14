@@ -20,6 +20,8 @@ mod engine;
 #[allow(dead_code)]
 mod errors;
 #[allow(dead_code)]
+mod file_intelligence;
+#[allow(dead_code)]
 mod models;
 #[allow(dead_code)]
 mod services;

@@ -21,7 +21,10 @@ use crate::database::repository::RepositoryError;
 ///
 /// v2 added `downloads.failure_category` plus the two ad-filter settings
 /// columns; see [`ensure_column`] for the in-place migration.
-pub const SCHEMA_VERSION: i64 = 2;
+///
+/// v3 added the `file_analyses` table used by the AI File Finder to persist
+/// the last analysis runs (bounded to a handful of runs, pruned on write).
+pub const SCHEMA_VERSION: i64 = 3;
 
 const DOWNLOADS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS downloads (
@@ -71,6 +74,26 @@ CREATE TABLE IF NOT EXISTS settings (
 const INDEX_SCHEMA: &str = "
 CREATE INDEX IF NOT EXISTS idx_downloads_state ON downloads(state);
 CREATE INDEX IF NOT EXISTS idx_downloads_created_at ON downloads(created_at);
+";
+
+const FILE_ANALYSES_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS file_analyses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    analysis_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    archive_type TEXT NOT NULL DEFAULT '',
+    score INTEGER NOT NULL DEFAULT 0,
+    classification TEXT NOT NULL DEFAULT '',
+    group_id TEXT,
+    part_number INTEGER,
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT ''
+)
+";
+
+const FILE_ANALYSES_INDEX_SCHEMA: &str = "
+CREATE INDEX IF NOT EXISTS idx_file_analyses_created_at ON file_analyses(created_at);
 ";
 
 /// A lock-protected wrapper around one SQLite connection.
@@ -168,6 +191,8 @@ impl Database {
             "ad_filter_list_path",
             "TEXT NOT NULL DEFAULT ''",
         )?;
+        conn.execute_batch(FILE_ANALYSES_SCHEMA)?;
+        conn.execute_batch(FILE_ANALYSES_INDEX_SCHEMA)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     }
@@ -305,5 +330,28 @@ mod tests {
         let path = temp_db("current");
         Database::init_db(&path).expect("initialise");
         Database::open(&path).expect("reopen at the current schema");
+    }
+
+    #[test]
+    fn file_analyses_table_and_index_are_created() {
+        let path = temp_db("analysis-table");
+        let database = Database::init_db(&path).expect("initialise");
+        let (table, index): (i64, i64) = database
+            .with_conn(|conn| {
+                let table: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'file_analyses'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let index: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_file_analyses_created_at'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok((table, index))
+            })
+            .expect("query sqlite master");
+        assert_eq!(table, 1, "file_analyses table missing");
+        assert_eq!(index, 1, "file_analyses index missing");
     }
 }

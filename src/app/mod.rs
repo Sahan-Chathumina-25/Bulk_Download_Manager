@@ -15,13 +15,14 @@ use egui::{
 
 use crate::app::backend::{AppBackend, Command, QueueAction, Startup, UiEvent};
 use crate::app::state::{
-    AddDownloadsState, Confirmation, DashboardState, DiscoveryState, HistoryState, Page,
-    QueueState, SettingsState, Severity,
+    AddDownloadsState, AiFinderState, Confirmation, DashboardState, DiscoveryState, HistoryState,
+    Page, QueueState, SettingsState, Severity,
 };
 use crate::config::Settings;
 use crate::models::download_status::DownloadState;
 
 pub mod add_downloads;
+pub mod ai_file_finder;
 pub mod backend;
 pub mod components;
 pub mod dashboard;
@@ -53,6 +54,7 @@ pub struct BulkDownloadApp {
     pub(crate) queue: QueueState,
     pub(crate) history: HistoryState,
     pub(crate) discovery: DiscoveryState,
+    pub(crate) ai: AiFinderState,
     pub(crate) add: AddDownloadsState,
     pub(crate) settings_state: SettingsState,
     pub(crate) dashboard: DashboardState,
@@ -61,6 +63,8 @@ pub struct BulkDownloadApp {
     pub(crate) settings_error: Option<String>,
     /// Folder picked on the Discover page; falls back to the configured one.
     pub(crate) discovery_destination: Option<std::path::PathBuf>,
+    /// Folder picked on the AI File Finder page; falls back to the configured one.
+    pub(crate) ai_destination: Option<std::path::PathBuf>,
     /// Line count of the URL box on the previous frame; used to clear the
     /// single-URL overrides when the batch size changes.
     pub(crate) add_line_count: usize,
@@ -104,6 +108,7 @@ impl BulkDownloadApp {
             queue: QueueState::default(),
             history: HistoryState::default(),
             discovery: DiscoveryState::default(),
+            ai: AiFinderState::default(),
             add: AddDownloadsState::new(),
             settings_state,
             dashboard: DashboardState::default(),
@@ -111,6 +116,7 @@ impl BulkDownloadApp {
             confirmation,
             settings_error: startup.settings_error,
             discovery_destination: None,
+            ai_destination: None,
             add_line_count: 0,
             history_dirty: true,
             dashboard_dirty: true,
@@ -250,6 +256,32 @@ impl BulkDownloadApp {
                 self.discovery.apply_result(*result);
                 self.toast(Severity::Info, "Scan finished.");
             }
+            UiEvent::AnalysisStatus(status) => {
+                self.ai.analyzing = status.starts_with("Analyzing");
+                self.ai.status = status;
+            }
+            UiEvent::AnalysisFinished(report) => {
+                self.ai.apply_report(*report);
+                self.toast(Severity::Info, "Analysis finished.");
+            }
+            UiEvent::AnalysisLoaded(report) => {
+                if let Some(report) = report {
+                    self.ai.apply_loaded(*report);
+                }
+            }
+            UiEvent::AiQueued(report) => {
+                let outcome = report.into_outcome();
+                if outcome.added > 0 {
+                    self.toast(
+                        Severity::Success,
+                        format!("{} archive file(s) added to the queue.", outcome.added),
+                    );
+                }
+                if let Some((_, reason)) = outcome.failed.first() {
+                    self.toast(Severity::Warning, reason.clone());
+                }
+                self.ai.outcome = Some(outcome);
+            }
             UiEvent::AddPreview(parsed) => {
                 self.add.preview = Some(*parsed);
                 self.add.preview_pending = false;
@@ -346,7 +378,8 @@ impl BulkDownloadApp {
                             2 => egui::Key::Num3,
                             3 => egui::Key::Num4,
                             4 => egui::Key::Num5,
-                            _ => egui::Key::Num6,
+                            5 => egui::Key::Num6,
+                            _ => egui::Key::Num7,
                         })
                 })
                 .map(|(_, page)| *page);
@@ -373,6 +406,7 @@ impl BulkDownloadApp {
             Page::History => self.history_dirty = true,
             Page::Dashboard => self.dashboard_dirty = true,
             Page::Queue => self.backend.send(Command::LoadQueue),
+            Page::AiFinder => self.backend.send(Command::LoadAnalysis),
             _ => {}
         }
     }
@@ -524,6 +558,7 @@ impl BulkDownloadApp {
             Page::Dashboard => dashboard::show(self, ui),
             Page::AddDownloads => add_downloads::show(self, ui),
             Page::Discover => discover::show(self, ui),
+            Page::AiFinder => ai_file_finder::show(self, ui),
             Page::Queue => queue_view::show(self, ui),
             Page::History => history_view::show(self, ui),
             Page::Settings => settings_view::show(self, ui),
@@ -646,14 +681,17 @@ impl BulkDownloadApp {
     }
 
     fn schedule_repaint(&self, ctx: &egui::Context) {
-        let busy = self.queue.has_active() || self.discovery.scanning || self.history.loading;
+        let busy = self.queue.has_active()
+            || self.discovery.scanning
+            || self.ai.analyzing
+            || self.history.loading;
         let delay = if busy {
             Duration::from_millis(250)
         } else {
             match self.page {
                 Page::Queue => Duration::from_millis(500),
                 Page::Dashboard | Page::History => Duration::from_millis(1500),
-                Page::AddDownloads | Page::Discover | Page::Settings => return,
+                Page::AddDownloads | Page::Discover | Page::AiFinder | Page::Settings => return,
             }
         };
         ctx.request_repaint_after(delay);
@@ -951,6 +989,17 @@ fn paint_page_icon(painter: &egui::Painter, rect: Rect, page: Page, color: Color
                 ],
                 Stroke::new(1.8, color),
             );
+        }
+        Page::AiFinder => {
+            // A four-point sparkle: the assistant marker for this page.
+            for (dx, dy) in [(0.0, -6.0), (6.0, 0.0), (0.0, 6.0), (-6.0, 0.0)] {
+                let tip = pos2(center.x + dx, center.y + dy);
+                let left = pos2(center.x + dy * 0.35, center.y - dx * 0.35);
+                let right = pos2(center.x - dy * 0.35, center.y + dx * 0.35);
+                painter.line_segment([left, tip], Stroke::new(1.4, color));
+                painter.line_segment([tip, right], Stroke::new(1.4, color));
+            }
+            painter.circle_filled(center, 1.6, color);
         }
         Page::Queue => {
             for offset in [-4.5, 0.0, 4.5] {

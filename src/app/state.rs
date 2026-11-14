@@ -10,27 +10,30 @@ use std::time::Duration;
 
 use crate::config::Settings;
 use crate::database::repository::HistoryQuery;
+use crate::file_intelligence::report::{AnalysisReport, CandidateReport};
 use crate::models::discovered_link::{DiscoveryCandidate, DiscoveryResult};
 use crate::models::download_item::DownloadRecord;
 use crate::models::download_status::{DownloadProgress, DownloadState};
 use crate::services::url_intake::ParseResult;
 
-/// The six top-level pages, in navigation order.
+/// The seven top-level pages, in navigation order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Page {
     Dashboard,
     AddDownloads,
     Discover,
+    AiFinder,
     Queue,
     History,
     Settings,
 }
 
 impl Page {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Dashboard,
         Self::AddDownloads,
         Self::Discover,
+        Self::AiFinder,
         Self::Queue,
         Self::History,
         Self::Settings,
@@ -42,6 +45,7 @@ impl Page {
             Self::Dashboard => "Dashboard",
             Self::AddDownloads => "Add Downloads",
             Self::Discover => "Discover",
+            Self::AiFinder => "AI File Finder",
             Self::Queue => "Queue",
             Self::History => "History",
             Self::Settings => "Settings",
@@ -54,9 +58,10 @@ impl Page {
             Self::Dashboard => "Ctrl+1",
             Self::AddDownloads => "Ctrl+2",
             Self::Discover => "Ctrl+3",
-            Self::Queue => "Ctrl+4",
-            Self::History => "Ctrl+5",
-            Self::Settings => "Ctrl+6",
+            Self::AiFinder => "Ctrl+4",
+            Self::Queue => "Ctrl+5",
+            Self::History => "Ctrl+6",
+            Self::Settings => "Ctrl+7",
         }
     }
 }
@@ -516,6 +521,219 @@ impl DiscoveryState {
             })
             .collect()
     }
+}
+
+/// Which source the last AI File Finder run used, so "Rescan" can repeat it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiRunSource {
+    /// Re-analyse the pasted URL box.
+    Pasted,
+    /// Re-analyse the last discovery result.
+    Discovered,
+}
+
+/// AI File Finder page: the last analysis report plus per-row tick state.
+#[derive(Default)]
+pub struct AiFinderState {
+    pub urls_text: String,
+    /// Multiline URL input for batches.
+    pub multiline: bool,
+    /// Analyze the links from the last Discover scan instead of the box.
+    pub analyze_discovered: bool,
+    /// Bounded HTTP verification (HEAD + first bytes) opt-in.
+    pub probe_metadata: bool,
+    pub analyzing: bool,
+    pub status: String,
+    pub report: Option<AnalysisReport>,
+    /// Parallel to `report.candidates`; `true` means "queue this row".
+    pub selected: Vec<bool>,
+    /// Candidate rows with an open evidence panel.
+    pub expanded: std::collections::BTreeSet<usize>,
+    /// Group cards that are expanded.
+    pub groups_expanded: std::collections::BTreeSet<String>,
+    /// Result of the last "Add Selected to Queue" action.
+    pub outcome: Option<AddOutcome>,
+    /// How to repeat the last run with "Rescan".
+    pub last_run: Option<AiRunSource>,
+}
+
+impl AiFinderState {
+    /// Store a finished report, pre-ticking the selectable candidates.
+    pub fn apply_report(&mut self, report: AnalysisReport) {
+        self.selected = report
+            .candidates
+            .iter()
+            .map(CandidateReport::is_selectable)
+            .collect();
+        self.status = analysis_summary(&report);
+        self.report = Some(report);
+        self.outcome = None;
+        self.analyzing = false;
+        self.expanded.clear();
+        self.groups_expanded.clear();
+    }
+
+    /// Show a loaded (persisted) report, but never while a run is in flight.
+    pub fn apply_loaded(&mut self, report: AnalysisReport) {
+        if self.analyzing {
+            return;
+        }
+        self.apply_report(report);
+    }
+
+    pub fn clear(&mut self) {
+        self.report = None;
+        self.selected.clear();
+        self.status.clear();
+        self.outcome = None;
+        self.analyzing = false;
+        self.last_run = None;
+        self.expanded.clear();
+        self.groups_expanded.clear();
+    }
+
+    pub fn candidates(&self) -> &[CandidateReport] {
+        self.report
+            .as_ref()
+            .map_or(&[], |report| report.candidates.as_slice())
+    }
+
+    pub fn is_selected(&self, index: usize) -> bool {
+        self.selected.get(index).copied().unwrap_or(false)
+    }
+
+    /// Tick or untick one candidate; unselectable rows never change.
+    pub fn toggle(&mut self, index: usize) {
+        let selectable = self
+            .candidates()
+            .get(index)
+            .is_some_and(CandidateReport::is_selectable);
+        if !selectable && let Some(slot) = self.selected.get_mut(index) {
+            *slot = false;
+            return;
+        }
+        if let Some(slot) = self.selected.get_mut(index) {
+            *slot = !*slot;
+        }
+    }
+
+    /// Tick every candidate that is selectable right now.
+    pub fn set_all(&mut self, selected: bool) {
+        let selectable: Vec<bool> = self
+            .candidates()
+            .iter()
+            .map(CandidateReport::is_selectable)
+            .collect();
+        for (slot, is_selectable) in self.selected.iter_mut().zip(selectable) {
+            if is_selectable {
+                *slot = selected;
+            }
+        }
+    }
+
+    /// Tick the members of every complete-looking group.
+    pub fn select_complete_groups(&mut self, selected: bool) {
+        let Some(report) = &self.report else {
+            return;
+        };
+        let complete: Vec<usize> = report
+            .groups
+            .iter()
+            .filter(|group| {
+                group.status == crate::file_intelligence::multipart::GroupStatus::Complete
+            })
+            .flat_map(|group| group.candidate_indexes.iter().copied())
+            .collect();
+        for index in complete {
+            if let Some(slot) = self.selected.get_mut(index) {
+                let selectable = report
+                    .candidates
+                    .get(index)
+                    .is_some_and(CandidateReport::is_selectable);
+                if selectable {
+                    *slot = selected;
+                }
+            }
+        }
+    }
+
+    pub fn selected_count(&self) -> usize {
+        self.selected.iter().filter(|ticked| **ticked).count()
+    }
+
+    /// The ticked candidates that can actually be queued.
+    pub fn selected_reports(&self) -> Vec<CandidateReport> {
+        self.candidates()
+            .iter()
+            .zip(&self.selected)
+            .filter(|(candidate, ticked)| **ticked && candidate.is_selectable())
+            .map(|(candidate, _)| candidate.clone())
+            .collect()
+    }
+
+    /// Convert the ticked reports back into discovery candidates so the
+    /// existing queue planner (dedup, validation, collision policy) applies.
+    pub fn selected_for_planner(&self) -> Vec<DiscoveryCandidate> {
+        self.selected_reports()
+            .into_iter()
+            .map(|candidate| DiscoveryCandidate {
+                candidate_url: candidate.url,
+                filename: candidate.filename,
+                extension: candidate.extension,
+                source_page_url: candidate.source_page_url,
+                content_type: candidate.content_type,
+                size: candidate.size,
+                is_likely_file: true,
+                anchor_text: candidate.anchor_text,
+                filtered_reason: None,
+            })
+            .collect()
+    }
+
+    /// True when any ticked candidate belongs to a group that is not
+    /// complete-looking; used for the pre-queue warning.
+    pub fn selected_has_incomplete_groups(&self) -> bool {
+        let Some(report) = &self.report else {
+            return false;
+        };
+        let incomplete: std::collections::BTreeSet<String> = report
+            .groups
+            .iter()
+            .filter(|group| {
+                !matches!(
+                    group.status,
+                    crate::file_intelligence::multipart::GroupStatus::Complete
+                )
+            })
+            .map(|group| group.key.clone())
+            .collect();
+        self.selected_reports().iter().any(|candidate| {
+            candidate
+                .group_key
+                .as_ref()
+                .is_some_and(|key| incomplete.contains(key))
+        })
+    }
+}
+
+/// One-line result banner for the AI File Finder page.
+pub fn analysis_summary(report: &AnalysisReport) -> String {
+    let mut summary = format!(
+        "Analyzed {} link(s): {} archive candidate(s), {} multipart group(s) ({} complete-looking), {} filtered as ads/trackers in {:.1}s.",
+        report.analyzed_count,
+        report.candidate_count,
+        report.groups.len(),
+        report.complete_groups,
+        report.filtered_count,
+        report.elapsed_seconds
+    );
+    if report.unverified_count > 0 {
+        summary.push_str(&format!(
+            " {} candidate(s) remain unverified.",
+            report.unverified_count
+        ));
+    }
+    summary
 }
 
 /// One-line result banner used by the Discover page.
@@ -1471,5 +1689,256 @@ mod tests {
     #[test]
     fn add_downloads_starts_immediately_by_default() {
         assert!(AddDownloadsState::new().start_immediately);
+    }
+}
+
+#[cfg(test)]
+mod ai_finder_tests {
+    use super::*;
+    use crate::file_intelligence::archive::ArchiveFormat;
+    use crate::file_intelligence::multipart::GroupStatus;
+    use crate::file_intelligence::report::{GroupReport, PartReport};
+    use crate::file_intelligence::scoring::Confidence;
+
+    fn candidate(filename: &str, score: u8, filtered: Option<&str>) -> CandidateReport {
+        candidate_in_group(filename, score, filtered, None)
+    }
+
+    fn candidate_in_group(
+        filename: &str,
+        score: u8,
+        filtered: Option<&str>,
+        group: Option<&str>,
+    ) -> CandidateReport {
+        CandidateReport {
+            url: format!("https://files.example.com/{filename}"),
+            filename: filename.to_string(),
+            extension: Some("zip".to_string()),
+            archive_type: "ZIP archive".to_string(),
+            format: Some(ArchiveFormat::Zip),
+            score,
+            confidence: Confidence::High,
+            status: "Candidate".to_string(),
+            group_key: group.map(str::to_string),
+            filtered_reason: filtered.map(str::to_string),
+            ..CandidateReport::default()
+        }
+    }
+
+    fn complete_group(indexes: Vec<usize>) -> GroupReport {
+        GroupReport {
+            key: "demo".to_string(),
+            display_name: "demo".to_string(),
+            archive_type: "ZIP archive".to_string(),
+            format: Some(ArchiveFormat::Zip),
+            parts: indexes
+                .iter()
+                .enumerate()
+                .map(|(position, index)| PartReport {
+                    filename: format!("demo.part0{}", position + 1),
+                    label: format!("part0{}", position + 1),
+                    number: position as u32 + 1,
+                    candidate_index: *index,
+                })
+                .collect(),
+            status: GroupStatus::Complete,
+            missing: Vec::new(),
+            duplicates: Vec::new(),
+            score: 80,
+            candidate_indexes: indexes,
+        }
+    }
+
+    fn incomplete_group(indexes: Vec<usize>) -> GroupReport {
+        let mut group = complete_group(indexes);
+        group.status = GroupStatus::Incomplete;
+        group.missing = vec!["part03".to_string()];
+        group
+    }
+
+    fn report(candidates: Vec<CandidateReport>, groups: Vec<GroupReport>) -> AnalysisReport {
+        let candidate_count = candidates.iter().filter(|c| c.is_selectable()).count();
+        AnalysisReport {
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            source: crate::file_intelligence::report::AnalysisSource::Pasted,
+            analyzed_count: candidates.len(),
+            candidate_count,
+            complete_groups: groups
+                .iter()
+                .filter(|group| group.status == GroupStatus::Complete)
+                .count(),
+            incomplete_groups: groups.len()
+                - groups
+                    .iter()
+                    .filter(|group| group.status == GroupStatus::Complete)
+                    .count(),
+            candidates,
+            groups,
+            filtered_count: 0,
+            unverified_count: 0,
+            errors: Vec::new(),
+            elapsed_seconds: 1.5,
+            probed: false,
+        }
+    }
+
+    #[test]
+    fn apply_report_preselects_the_selectable_rows() {
+        let mut ai = AiFinderState::default();
+        ai.apply_report(report(
+            vec![
+                candidate("good.zip", 80, None),
+                candidate("weak.zip", 10, None),
+                candidate("ad.zip", 90, Some("matched ad/tracker domain")),
+            ],
+            vec![],
+        ));
+        assert_eq!(ai.selected, vec![true, false, false]);
+        assert_eq!(ai.selected_count(), 1);
+        assert!(!ai.status.is_empty());
+        assert!(!ai.analyzing);
+    }
+
+    #[test]
+    fn toggling_respects_the_selectable_rule() {
+        let mut ai = AiFinderState::default();
+        ai.apply_report(report(
+            vec![
+                candidate("good.zip", 80, None),
+                candidate("ad.zip", 90, Some("ad")),
+            ],
+            vec![],
+        ));
+        ai.toggle(0);
+        assert!(!ai.is_selected(0), "started ticked, so toggle unticks");
+        ai.toggle(0);
+        assert!(ai.is_selected(0));
+        // The filtered row can never be ticked.
+        ai.toggle(1);
+        assert!(!ai.is_selected(1));
+    }
+
+    #[test]
+    fn set_all_only_touches_selectable_rows() {
+        let mut ai = AiFinderState::default();
+        ai.apply_report(report(
+            vec![
+                candidate("good.zip", 80, None),
+                candidate("ad.zip", 90, Some("ad")),
+            ],
+            vec![],
+        ));
+        ai.set_all(true);
+        assert_eq!(ai.selected, vec![true, false]);
+        ai.set_all(false);
+        assert_eq!(ai.selected, vec![false, false]);
+    }
+
+    #[test]
+    fn complete_groups_can_be_selected_in_one_go() {
+        let mut ai = AiFinderState::default();
+        ai.apply_report(report(
+            vec![
+                candidate_in_group("demo.part01.zip", 80, None, Some("demo")),
+                candidate_in_group("demo.part02.zip", 80, None, Some("demo")),
+                candidate("lone.zip", 80, None),
+            ],
+            vec![complete_group(vec![0, 1])],
+        ));
+        // Untick everything first: the preselection is not what is tested.
+        ai.set_all(false);
+        ai.select_complete_groups(true);
+        assert_eq!(ai.selected, vec![true, true, false]);
+        ai.select_complete_groups(false);
+        assert_eq!(ai.selected, vec![false, false, false]);
+    }
+
+    #[test]
+    fn selected_rows_convert_back_to_planner_candidates() {
+        let mut ai = AiFinderState::default();
+        ai.apply_report(report(
+            vec![
+                candidate("good.zip", 80, None),
+                candidate("ad.zip", 90, Some("ad")),
+            ],
+            vec![],
+        ));
+        ai.set_all(false);
+        ai.toggle(0);
+        let planned = ai.selected_for_planner();
+        assert_eq!(planned.len(), 1);
+        assert_eq!(
+            planned[0].candidate_url,
+            "https://files.example.com/good.zip"
+        );
+        assert_eq!(planned[0].filename, "good.zip");
+        assert_eq!(planned[0].extension.as_deref(), Some("zip"));
+        assert!(planned[0].is_likely_file);
+        assert!(planned[0].filtered_reason.is_none());
+    }
+
+    #[test]
+    fn queueing_an_incomplete_group_is_flagged() {
+        let mut ai = AiFinderState::default();
+        ai.apply_report(report(
+            vec![
+                candidate_in_group("demo.part01.zip", 80, None, Some("demo")),
+                candidate_in_group("demo.part02.zip", 80, None, Some("demo")),
+            ],
+            vec![incomplete_group(vec![0, 1])],
+        ));
+        // The preselection ticks everything; untick to test the check itself.
+        ai.set_all(false);
+        assert!(!ai.selected_has_incomplete_groups(), "nothing ticked yet");
+        ai.set_all(true);
+        assert!(ai.selected_has_incomplete_groups());
+    }
+
+    #[test]
+    fn a_complete_group_is_not_flagged() {
+        let mut ai = AiFinderState::default();
+        ai.apply_report(report(
+            vec![
+                candidate_in_group("demo.part01.zip", 80, None, Some("demo")),
+                candidate_in_group("demo.part02.zip", 80, None, Some("demo")),
+            ],
+            vec![complete_group(vec![0, 1])],
+        ));
+        ai.set_all(true);
+        assert!(!ai.selected_has_incomplete_groups());
+    }
+
+    #[test]
+    fn loaded_reports_do_not_stomp_an_active_run() {
+        let mut ai = AiFinderState {
+            analyzing: true,
+            ..AiFinderState::default()
+        };
+        ai.apply_loaded(report(vec![candidate("good.zip", 80, None)], vec![]));
+        assert!(ai.report.is_none());
+        assert!(ai.selected.is_empty());
+
+        ai.analyzing = false;
+        ai.apply_loaded(report(vec![candidate("good.zip", 80, None)], vec![]));
+        assert!(ai.report.is_some());
+        assert_eq!(ai.selected, vec![true]);
+    }
+
+    #[test]
+    fn the_summary_line_names_the_counts() {
+        let summary = analysis_summary(&report(
+            vec![candidate("good.zip", 80, None)],
+            vec![complete_group(vec![0])],
+        ));
+        assert!(summary.contains("Analyzed 1 link(s)"), "summary: {summary}");
+        assert!(
+            summary.contains("1 archive candidate(s)"),
+            "summary: {summary}"
+        );
+        assert!(
+            summary.contains("1 multipart group(s)"),
+            "summary: {summary}"
+        );
+        assert!(summary.contains("1.5s"), "summary: {summary}");
     }
 }

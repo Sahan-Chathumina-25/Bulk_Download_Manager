@@ -18,11 +18,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::app::state::{AddOutcome, DashboardStats};
 use crate::config::Settings;
+use crate::database::analysis_store::AnalysisStore;
 use crate::database::connection::Database;
 use crate::database::repository::{DownloadRepository, HistoryQuery};
 use crate::engine::manager::DownloadManager;
 use crate::engine::progress::DownloadProgress;
 use crate::engine::worker::EngineEvent;
+use crate::file_intelligence::engine::FileIntelligenceEngine;
+use crate::file_intelligence::report::AnalysisReport;
 use crate::models::discovered_link::{DiscoveryCandidate, DiscoveryResult};
 use crate::models::download_item::DownloadRecord;
 use crate::services::discovery_planner::{execute_queue_plan, plan_discovery_queue};
@@ -121,6 +124,24 @@ pub enum Command {
         candidates: Vec<DiscoveryCandidate>,
         destination: PathBuf,
     },
+    /// Run the AI File Finder over pasted URL lines.
+    AnalyzeUrls {
+        text: String,
+        probe: bool,
+    },
+    /// Run the AI File Finder over links from the last discovery scan.
+    AnalyzeCandidates {
+        candidates: Vec<DiscoveryCandidate>,
+        probe: bool,
+    },
+    CancelAnalysis,
+    /// Reload the most recent persisted analysis run.
+    LoadAnalysis,
+    /// Queue the candidates the user selected on the AI File Finder page.
+    EnqueueAiCandidates {
+        candidates: Vec<DiscoveryCandidate>,
+        destination: PathBuf,
+    },
     QueueAction {
         ids: Vec<i64>,
         action: QueueAction,
@@ -147,6 +168,27 @@ pub struct BatchReport {
     /// `(label, reason)` pairs for everything that did not make it.
     pub failed: Vec<(String, String)>,
     pub started: usize,
+}
+
+/// Where an AI File Finder run gets its links from.
+pub enum AnalysisInput {
+    /// Raw pasted URL lines.
+    Urls(String),
+    /// Candidates already discovered by a page scan.
+    Candidates(Vec<DiscoveryCandidate>),
+}
+
+impl AnalysisInput {
+    fn len(&self) -> usize {
+        match self {
+            Self::Urls(text) => text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .count(),
+            Self::Candidates(candidates) => candidates.len(),
+        }
+    }
 }
 
 impl BatchReport {
@@ -179,6 +221,10 @@ pub enum UiEvent {
     },
     ScanStatus(String),
     ScanFinished(Box<DiscoveryResult>),
+    AnalysisStatus(String),
+    AnalysisFinished(Box<AnalysisReport>),
+    AnalysisLoaded(Option<Box<AnalysisReport>>),
+    AiQueued(BatchReport),
     AddPreview(Box<ParseResult>),
     AddResult(BatchReport),
     DiscoverQueued(BatchReport),
@@ -219,7 +265,9 @@ impl AppBackend {
                 config.database_path.display()
             )
         })?;
-        let repository = Arc::new(DownloadRepository::new(Arc::new(database)));
+        let database = Arc::new(database);
+        let repository = Arc::new(DownloadRepository::new(Arc::clone(&database)));
+        let analysis_store = AnalysisStore::new(Arc::clone(&database));
 
         // A corrupt settings row is recoverable: fall back to defaults and let
         // the shell surface the warning instead of refusing to start.
@@ -257,9 +305,11 @@ impl AppBackend {
         let actor = Actor {
             repository,
             manager,
+            analysis_store,
             settings: settings.clone(),
             events: events.clone(),
             scan_cancel: None,
+            analysis_cancel: None,
         };
         let actor_handle = runtime.spawn(async move { actor.run(command_rx).await });
 
@@ -357,9 +407,11 @@ async fn forward_engine_events(
 struct Actor {
     repository: Arc<DownloadRepository>,
     manager: DownloadManager,
+    analysis_store: AnalysisStore,
     settings: Settings,
     events: Sender<UiEvent>,
     scan_cancel: Option<CancellationToken>,
+    analysis_cancel: Option<CancellationToken>,
 }
 
 impl Actor {
@@ -397,6 +449,21 @@ impl Actor {
                 candidates,
                 destination,
             } => self.enqueue_candidates(candidates, destination),
+            Command::AnalyzeUrls { text, probe } => {
+                self.start_analysis(AnalysisInput::Urls(text), probe)
+            }
+            Command::AnalyzeCandidates { candidates, probe } => {
+                self.start_analysis(AnalysisInput::Candidates(candidates), probe)
+            }
+            Command::CancelAnalysis => self.cancel_analysis(),
+            Command::LoadAnalysis => self.load_analysis(),
+            Command::EnqueueAiCandidates {
+                candidates,
+                destination,
+            } => {
+                let report = self.run_enqueue(candidates, destination);
+                self.emit(UiEvent::AiQueued(report));
+            }
             Command::QueueAction { ids, action } => self.run_queue_action(&ids, action),
             Command::StartAll => {
                 let started = self.manager.start_all();
@@ -512,14 +579,30 @@ impl Actor {
     }
 
     fn enqueue_candidates(&mut self, candidates: Vec<DiscoveryCandidate>, destination: PathBuf) {
+        let report = self.run_enqueue(candidates, destination);
+        self.emit(UiEvent::DiscoverQueued(report));
+    }
+
+    /// Shared enqueue path for the Discover and AI File Finder pages:
+    /// deduplicates against the queue and history, applies the existing
+    /// filename collision policy and never auto-starts without a report.
+    fn run_enqueue(
+        &mut self,
+        candidates: Vec<DiscoveryCandidate>,
+        destination: PathBuf,
+    ) -> BatchReport {
         let allow_private = self.settings.allow_private_addresses;
         let existing: Vec<String> = match self.repository.list_all() {
             Ok(rows) => rows.into_iter().map(|record| record.source_url).collect(),
             Err(error) => {
-                self.emit(UiEvent::Error(format!(
-                    "could not read the existing queue: {error}"
-                )));
-                return;
+                return BatchReport {
+                    added: 0,
+                    failed: vec![(
+                        "queue".to_string(),
+                        format!("could not read the existing queue: {error}"),
+                    )],
+                    started: 0,
+                };
             }
         };
 
@@ -544,12 +627,101 @@ impl Actor {
         let report = execute_queue_plan(plan, &directory, &mut add, Some(&mut start));
         notices.extend(report.failed);
 
-        self.emit(UiEvent::DiscoverQueued(BatchReport {
+        let outcome = BatchReport {
             added: report.added.len(),
             failed: notices,
             started,
-        }));
+        };
         self.refresh_queue();
+        outcome
+    }
+
+    // ---- AI file finder ----------------------------------------------------
+
+    /// Spawn the analysis pipeline. Only one run is active at a time.
+    fn start_analysis(&mut self, input: AnalysisInput, probe: bool) {
+        // Only one analysis at a time: cancel whatever is still running.
+        if let Some(token) = self.analysis_cancel.take() {
+            token.cancel();
+        }
+        let token = CancellationToken::new();
+        self.analysis_cancel = Some(token.clone());
+
+        self.emit(UiEvent::AnalysisStatus(format!(
+            "Analyzing {} URL(s)…",
+            input.len()
+        )));
+
+        let settings = self.settings.clone();
+        let events = self.events.clone();
+        let analysis_store = self.analysis_store.clone();
+        tokio::spawn(async move {
+            let engine = FileIntelligenceEngine::new(&settings);
+            let report = match input {
+                AnalysisInput::Urls(text) => {
+                    // DNS is blocking; parse on the blocking pool like the
+                    // Add Downloads flow does.
+                    let allow_private = settings.allow_private_addresses;
+                    match tokio::task::spawn_blocking(move || parse_url_lines(&text, allow_private))
+                        .await
+                    {
+                        Ok(parsed) => {
+                            for (line, reason) in &parsed.rejected {
+                                let _ = events.send(UiEvent::AnalysisStatus(format!(
+                                    "Skipped {line}: {reason}"
+                                )));
+                            }
+                            engine.analyze_urls(parsed.accepted, probe, &token).await
+                        }
+                        Err(error) => {
+                            let _ =
+                                events.send(UiEvent::Error(format!("URL parsing failed: {error}")));
+                            return;
+                        }
+                    }
+                }
+                AnalysisInput::Candidates(candidates) => {
+                    engine.analyze_candidates(candidates, probe, &token).await
+                }
+            };
+            if token.is_cancelled() {
+                let _ = events.send(UiEvent::AnalysisStatus("Analysis cancelled.".to_string()));
+                return;
+            }
+            // Persist (best effort) before telling the UI, so a restart shows
+            // the same result set.
+            if let Err(error) = analysis_store.save_report(&report) {
+                tracing::warn!(error = %error, "could not persist the analysis result");
+            }
+            let _ = events.send(UiEvent::AnalysisFinished(Box::new(report)));
+        });
+    }
+
+    fn cancel_analysis(&mut self) {
+        match self.analysis_cancel.take() {
+            Some(token) => {
+                token.cancel();
+                self.emit(UiEvent::AnalysisStatus("Analysis cancelled.".to_string()));
+            }
+            None => self.emit(UiEvent::AnalysisStatus(
+                "No analysis is running.".to_string(),
+            )),
+        }
+    }
+
+    fn load_analysis(&self) {
+        let events = self.events.clone();
+        let analysis_store = self.analysis_store.clone();
+        tokio::task::spawn_blocking(move || {
+            let report = match analysis_store.latest_report() {
+                Ok(report) => report,
+                Err(error) => {
+                    tracing::warn!(error = %error, "could not load the stored analysis");
+                    None
+                }
+            };
+            let _ = events.send(UiEvent::AnalysisLoaded(report.map(Box::new)));
+        });
     }
 
     // ---- queue ------------------------------------------------------------
@@ -682,6 +854,9 @@ mod tests {
     use std::time::Instant;
 
     use crate::engine::fake_site::FakeSite;
+    use crate::file_intelligence::archive::ArchiveFormat;
+    use crate::file_intelligence::report::{AnalysisSource, CandidateReport};
+    use crate::file_intelligence::scoring::Confidence;
     use crate::models::download_status::DownloadState;
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -1278,5 +1453,153 @@ mod tests {
         );
 
         drop(backend);
+    }
+
+    // ---- AI File Finder ---------------------------------------------------
+
+    fn expect_queue(event: UiEvent) -> BatchReport {
+        match event {
+            UiEvent::AiQueued(report) => report,
+            _ => panic!("expected a queue report"),
+        }
+    }
+
+    #[tokio::test]
+    async fn analyzing_pasted_urls_emits_a_report_and_persists_it() {
+        let site = spawn_fixture();
+        site.set_file(
+            "bundle.zip",
+            [b"PK\x03\x04".as_slice(), &[0u8; 128]].concat(),
+        );
+
+        let dir = temp_dir("ai-analyze");
+        let (backend, _startup, rx) = start(&dir, settings_for(&dir));
+
+        backend.send(Command::AnalyzeUrls {
+            text: site.url("/files/bundle.zip"),
+            probe: true,
+        });
+
+        match wait_for(
+            &rx,
+            |event| matches!(event, UiEvent::AnalysisFinished(_)),
+            10,
+        ) {
+            UiEvent::AnalysisFinished(report) => {
+                let report = *report;
+                assert_eq!(report.source, AnalysisSource::Pasted);
+                assert_eq!(report.candidates.len(), 1);
+                let candidate = &report.candidates[0];
+                assert_eq!(candidate.filename, "bundle.zip");
+                assert!(candidate.score >= 75, "score was {}", candidate.score);
+            }
+            _ => unreachable!(),
+        }
+
+        // The run was saved, so a fresh backend can load it back.
+        let reopened = AnalysisStore::new(Arc::new(
+            Database::init_db(dir.join("downloads.db")).expect("reopen database"),
+        ));
+        let loaded = reopened.latest_report().expect("read").expect("saved");
+        assert_eq!(loaded.candidates[0].filename, "bundle.zip");
+    }
+
+    #[tokio::test]
+    async fn enqueueing_ai_candidates_runs_the_planner() {
+        let site = spawn_fixture();
+        site.set_file("payload.bin", b"ai-queue-payload".to_vec());
+
+        let dir = temp_dir("ai-enqueue");
+        let destination = dir.join("out");
+        std::fs::create_dir_all(&destination).expect("create destination");
+        let (backend, _startup, rx) = start(&dir, settings_for(&destination));
+
+        let candidates = vec![DiscoveryCandidate {
+            candidate_url: site.url("/files/payload.bin"),
+            filename: "payload.bin".to_string(),
+            extension: Some("bin".to_string()),
+            source_page_url: site.url("/page"),
+            content_type: None,
+            size: None,
+            is_likely_file: true,
+            anchor_text: Some("Download".to_string()),
+            filtered_reason: None,
+        }];
+        backend.send(Command::EnqueueAiCandidates {
+            candidates: candidates.clone(),
+            destination: destination.clone(),
+        });
+
+        let report = expect_queue(wait_for(
+            &rx,
+            |event| matches!(event, UiEvent::AiQueued(_)),
+            10,
+        ));
+        assert_eq!(report.added, 1, "failed: {:?}", report.failed);
+        assert!(report.failed.is_empty());
+        // The AI page queues and starts immediately.
+        assert_eq!(report.started, 1);
+
+        // The queued candidate downloads to completion.
+        match wait_for(
+            &rx,
+            |event| matches!(event, UiEvent::StateChanged(record) if record.state == DownloadState::Completed),
+            20,
+        ) {
+            UiEvent::StateChanged(record) => {
+                assert_eq!(record.display_name, "payload.bin");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn loading_analysis_returns_the_persisted_run() {
+        let dir = temp_dir("ai-load");
+        let (backend, _startup, rx) = start(&dir, settings_for(&dir));
+
+        // Seed one run directly, then ask the backend to load it.
+        let store = AnalysisStore::new(Arc::new(
+            Database::init_db(dir.join("downloads.db")).expect("open database"),
+        ));
+        let report = AnalysisReport {
+            created_at: "2026-02-02T00:00:00Z".to_string(),
+            source: AnalysisSource::Pasted,
+            candidates: vec![CandidateReport {
+                filename: "stored.zip".to_string(),
+                archive_type: "ZIP archive".to_string(),
+                format: Some(ArchiveFormat::Zip),
+                score: 80,
+                confidence: Confidence::High,
+                status: "Candidate".to_string(),
+                ..CandidateReport::default()
+            }],
+            ..AnalysisReport::default()
+        };
+        store.save_report(&report).expect("seed run");
+
+        backend.send(Command::LoadAnalysis);
+        match wait_for(&rx, |event| matches!(event, UiEvent::AnalysisLoaded(_)), 10) {
+            UiEvent::AnalysisLoaded(loaded) => {
+                let loaded = loaded.expect("a stored run exists");
+                assert_eq!(loaded.candidates[0].filename, "stored.zip");
+                assert_eq!(loaded.candidates[0].score, 80);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn loading_without_history_reports_none() {
+        let dir = temp_dir("ai-load-empty");
+        let (backend, _startup, rx) = start(&dir, settings_for(&dir));
+
+        backend.send(Command::LoadAnalysis);
+        match wait_for(&rx, |event| matches!(event, UiEvent::AnalysisLoaded(_)), 10) {
+            UiEvent::AnalysisLoaded(loaded) => {
+                assert!(loaded.is_none(), "nothing was stored yet");
+            }
+            _ => unreachable!(),
+        }
     }
 }
