@@ -7,10 +7,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
-// These layers are complete and unit-tested, but parts of their public surface
-// (validation entry points, retry classification, database inspection helpers)
-// are not reachable from the UI yet. Keep the allowance per module instead of
-// disabling the lint for the whole crate.
 #[allow(dead_code)]
 mod config;
 #[allow(dead_code)]
@@ -28,13 +24,15 @@ mod services;
 
 use std::sync::mpsc;
 
-use crate::app::BulkDownloadApp;
-use crate::app::backend::{AppBackend, BackendConfig, UiEvent, default_database_path};
+use gpui_kit::*;
 
-fn main() -> eframe::Result {
+use crate::app::App;
+use crate::app::backend::{AppBackend, BackendConfig, default_database_path};
+
+fn main() {
     init_tracing();
 
-    let (events_tx, events_rx) = mpsc::channel::<UiEvent>();
+    let (events_tx, events_rx) = mpsc::channel();
     let (backend, startup) = match AppBackend::start(
         BackendConfig {
             database_path: default_database_path(),
@@ -53,23 +51,30 @@ fn main() -> eframe::Result {
         }
     };
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Bulk Download Manager")
-            .with_inner_size([1240.0, 780.0])
-            .with_min_inner_size([1000.0, 650.0]),
-        ..Default::default()
-    };
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::Assets)
+        .run(move |cx| {
+            gpui_kit::init(cx);
 
-    eframe::run_native(
-        "Bulk Download Manager",
-        options,
-        Box::new(move |cc| {
-            Ok(Box::new(BulkDownloadApp::new(
-                cc, backend, startup, events_rx,
-            )))
-        }),
-    )
+            let bounds = Bounds::centered(
+                None,
+                size(px(1240.0), px(780.0)),
+                cx,
+            );
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Bulk Download Manager".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            open_window(options, cx, |window, cx| {
+                cx.new(|view_cx| App::new(backend, startup, events_rx, window, view_cx))
+            })
+            .expect("failed to open main window");
+        });
 }
 
 /// Initialise structured logging; `RUST_LOG` overrides the default filter.
