@@ -1,371 +1,237 @@
-//! Add Downloads: paste or import URLs, then queue them.
+//! Add Downloads: paste URLs, review them, then queue them.
 
-use egui::{RichText, Ui};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::input::{Input, Textarea};
+use gpui_kit::component::{Disableable as _, IconName};
+use gpui_kit::*;
 
+use super::{App, components, theme};
 use crate::app::backend::Command;
-use crate::app::state::{Page, Severity};
-use crate::app::theme::Action;
-use crate::app::{BulkDownloadApp, components, theme};
-use crate::services::validation::redact_url;
 
-/// Shown when neither the form nor the settings name a folder.
-const NO_DESTINATION: &str =
-    "No destination folder set. Set one here (or in Settings → Destination folder).";
-/// Shown for a submit with no URL lines.
-const EMPTY_INPUT: &str = "Nothing to add — enter at least one http/https URL per line.";
-/// Helper under the editor; the tab rule matches the parser.
-const EDITOR_HELP: &str = "One URL per line. A second tab-separated column is ignored, blank lines are skipped and exact duplicates are collapsed.";
+pub fn show(app: &App, window: &mut Window, cx: &mut Context<App>) -> impl IntoElement {
+    let palette = theme::palette(window, cx);
+    let single_url = app.add_line_count == 1;
 
-pub fn show(app: &mut BulkDownloadApp, ui: &mut Ui) {
-    let palette = theme::palette(ui);
-    components::page_header(
-        ui,
-        "Add Downloads",
-        "Paste links and queue them for download",
-        None,
-    );
-
-    track_single_url(app);
-
-    let has_lines = app
-        .add
-        .urls_text
-        .lines()
-        .any(|line| !line.trim().is_empty());
-    let valid_entries = app
-        .add
-        .preview
-        .as_ref()
-        .map_or(0, |preview| preview.accepted.len());
-    let can_add = if app.add.preview.is_some() {
-        valid_entries > 0
-    } else {
-        has_lines
-    };
-
-    ui.horizontal(|ui| {
-        if components::button(ui, "Import TXT…", Action::Import).clicked() {
-            import_text_file(app);
-        }
-        if components::button(ui, "Preview", Action::Info).clicked() {
-            if has_lines {
-                app.add.error = None;
-                app.add.outcome = None;
-                app.add.preview_pending = true;
-                app.send(Command::PreviewUrls {
-                    text: app.add.urls_text.clone(),
-                });
-            } else {
-                app.toast(Severity::Warning, EMPTY_INPUT);
-            }
-        }
-        if components::link_button(ui, "Clear").clicked() {
-            app.add.urls_text.clear();
-            app.add.filename_override.clear();
-            app.add.checksum.clear();
-            app.add.clear_feedback();
-            app.add_line_count = 0;
-        }
-
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add_enabled_ui(
-                can_add && !app.add.add_pending && !app.add.preview_pending,
-                |ui| {
-                    if components::button(ui, "Add to Queue", Action::Add).clicked() {
-                        submit(app);
-                    }
-                },
-            );
-            ui.add_space(theme::SPACE_2);
-            ui.checkbox(&mut app.add.start_immediately, "Start immediately");
-        });
-    });
-
-    ui.add_space(theme::SPACE_2);
-
-    components::card_for(ui).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            components::section_heading(ui, "URLs");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if app.add.preview_pending {
-                    ui.label(
-                        RichText::new("Checking URLs…")
-                            .size(theme::SMALL_SIZE)
-                            .color(palette.warning),
-                    );
-                } else if app.add.add_pending {
-                    ui.label(
-                        RichText::new("Adding to the queue…")
-                            .size(theme::SMALL_SIZE)
-                            .color(palette.accent),
-                    );
-                }
-            });
-        });
-        ui.add_space(theme::SPACE_2);
-        ui.add(
-            egui::TextEdit::multiline(&mut app.add.urls_text)
-                .desired_rows(8)
-                .desired_width(f32::INFINITY)
-                .hint_text("https://example.com/file.zip\nhttps://example.com/another-file.zip"),
-        );
-        ui.add_space(theme::SPACE_1);
-        components::muted(ui, EDITOR_HELP);
-    });
-
-    ui.add_space(theme::SPACE_2);
-
-    components::card_for(ui).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        components::section_heading(ui, "Destination");
-        ui.add_space(theme::SPACE_1);
-
-        let effective = app.add.effective_destination(&app.settings);
-        ui.horizontal(|ui| {
-            match &effective {
-                Some(path) => ui.label(
-                    RichText::new(path.display().to_string())
-                        .color(palette.text)
-                        .monospace(),
+    let form = div()
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
+        .child(components::section_title("Download URLs", palette.text))
+        .child(
+            div()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(palette.border)
+                .bg(palette.surface_alt)
+                .child(Textarea::new(&app.add_urls).h(px(150.0))),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(12.0))
+                .child(
+                    Button::new("add-pick-folder")
+                        .icon(IconName::Folder)
+                        .label("Destination")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                this.add.destination = Some(folder);
+                                cx.notify();
+                            }
+                        })),
+                )
+                .child(components::muted(destination_label(app), palette.text_muted)),
+        )
+        .child(
+            div()
+                .flex()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(components::muted("File name (one URL only)", palette.text_muted))
+                        .child(Input::new(&app.add_filename).disabled(!single_url)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(components::muted("SHA-256 (one URL only)", palette.text_muted))
+                        .child(Input::new(&app.add_checksum).disabled(!single_url)),
                 ),
-                None => ui.label(RichText::new("Not set").color(palette.warning)),
-            };
-            if components::button(ui, "Browse…", Action::Secondary).clicked()
-                && let Some(folder) = rfd::FileDialog::new().pick_folder()
-            {
-                app.add.destination = Some(folder);
-            }
-            if app.add.destination.is_some() && components::link_button(ui, "Use default").clicked()
-            {
-                app.add.destination = None;
-            }
-        });
-
-        if effective.is_none() {
-            components::muted(ui, NO_DESTINATION);
-        } else if app.add.destination.is_none() {
-            components::muted(ui, "Using the folder from Settings.");
-        }
-    });
-
-    ui.add_space(theme::SPACE_2);
-
-    let single = app.add_line_count == 1;
-    components::card_for(ui).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        components::section_heading(ui, "Overrides");
-        components::muted(
-            ui,
-            "A filename and checksum apply only when exactly one URL is entered.",
+        )
+        .child(
+            Checkbox::new("add-start")
+                .label("Start downloads immediately")
+                .checked(app.add.start_immediately)
+                .on_change(cx.listener(|this, value, _, cx| {
+                    this.add.start_immediately = *value;
+                    cx.notify();
+                })),
+        )
+        .child(
+            div()
+                .flex()
+                .gap(px(8.0))
+                .child(
+                    Button::new("add-preview")
+                        .label("Preview")
+                        .disabled(app.add.preview_pending)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let text = this.add_urls.read(cx).value().to_string();
+                            this.add.preview_pending = true;
+                            this.send(Command::PreviewUrls { text });
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("add-submit")
+                        .primary()
+                        .icon(IconName::Plus)
+                        .label("Add to queue")
+                        .disabled(app.add.add_pending)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.add.add_pending = true;
+                            let text = this.add_urls.read(cx).value().to_string();
+                            this.add_line_count = count_lines(&text);
+                            let single = this.add_line_count == 1;
+                            let filename = if single {
+                                let value = this.add_filename.read(cx).value().trim().to_string();
+                                (!value.is_empty()).then_some(value)
+                            } else {
+                                None
+                            };
+                            let checksum = if single {
+                                let value = this.add_checksum.read(cx).value().trim().to_string();
+                                (!value.is_empty()).then_some(value)
+                            } else {
+                                None
+                            };
+                            let destination = this.add.effective_destination(&this.settings);
+                            let start_now = this.add.start_immediately;
+                            this.send(Command::AddUrls {
+                                text,
+                                destination,
+                                filename,
+                                checksum,
+                                start_now,
+                            });
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("add-import")
+                        .label("Import TXT…")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Text", &["txt"])
+                                .pick_file()
+                            {
+                                match std::fs::read_to_string(&path) {
+                                    Ok(text) => {
+                                        this.add_urls.update(cx, |state, cx| {
+                                            state.set_value(&text, window, cx);
+                                        });
+                                        this.add_line_count = count_lines(&text);
+                                    }
+                                    Err(error) => this.toast(
+                                        super::state::Severity::Error,
+                                        format!("Could not read {}: {error}", path.display()),
+                                    ),
+                                }
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("add-clear")
+                        .ghost()
+                        .label("Clear")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.add_urls.update(cx, |state, cx| {
+                                state.set_value("", window, cx);
+                            });
+                            this.add.clear_feedback();
+                            this.add_line_count = 0;
+                            cx.notify();
+                        })),
+                ),
         );
-        ui.add_space(theme::SPACE_1);
 
-        ui.add_enabled_ui(single, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Filename").color(palette.muted));
-                ui.add(
-                    egui::TextEdit::singleline(&mut app.add.filename_override)
-                        .hint_text("keep the server's name")
-                        .desired_width(320.0),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("SHA-256").color(palette.muted));
-                ui.add(
-                    egui::TextEdit::singleline(&mut app.add.checksum)
-                        .hint_text("optional 64-character hex digest")
-                        .desired_width(320.0),
-                );
-            });
-        });
-    });
+    let mut column = div()
+        .flex()
+        .flex_col()
+        .gap(px(18.0))
+        .child(components::page_header(
+            "Add Downloads",
+            "Paste URLs, review them, then add them to the queue.",
+        ))
+        .child(
+            components::card(form, palette)
+        );
 
     if let Some(error) = &app.add.error {
-        ui.add_space(theme::SPACE_2);
-        components::status_badge(ui, error, palette.error);
+        column = column.child(
+            div()
+                .text_size(px(12.0))
+                .text_color(palette.danger)
+                .child(error.clone()),
+        );
     }
 
     if let Some(preview) = &app.add.preview {
-        ui.add_space(theme::SPACE_2);
-        components::card_for(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            components::section_heading(ui, "Preview");
-            ui.add_space(theme::SPACE_1);
-
-            ui.horizontal_wrapped(|ui| {
-                components::status_badge(
-                    ui,
-                    &format!("{} valid", preview.accepted.len()),
-                    palette.success,
-                );
-                components::status_badge(
-                    ui,
-                    &format!("{} duplicate(s)", preview.duplicates.len()),
-                    palette.warning,
-                );
-                components::status_badge(
-                    ui,
-                    &format!("{} invalid", preview.rejected.len()),
-                    palette.error,
-                );
-            });
-
-            if preview.accepted.is_empty()
-                && preview.duplicates.is_empty()
-                && preview.rejected.is_empty()
-            {
-                components::muted(ui, "No URLs found in the editor.");
-            }
-
-            if !preview.duplicates.is_empty() {
-                ui.add_space(theme::SPACE_2);
-                for url in preview.duplicates.iter().take(5) {
-                    ui.label(
-                        RichText::new(format!("Duplicate — {}", redact_url(url)))
-                            .size(theme::SMALL_SIZE)
-                            .color(palette.warning),
-                    );
-                }
-                if preview.duplicates.len() > 5 {
-                    components::muted(
-                        ui,
-                        format!("…and {} more duplicate(s).", preview.duplicates.len() - 5),
-                    );
-                }
-            }
-
-            if !preview.rejected.is_empty() {
-                ui.add_space(theme::SPACE_2);
-                for (url, reason) in preview.rejected.iter().take(8) {
-                    ui.label(
-                        RichText::new(format!("Invalid — {} — {reason}", redact_url(url)))
-                            .size(theme::SMALL_SIZE)
-                            .color(palette.error),
-                    );
-                }
-                if preview.rejected.len() > 8 {
-                    components::muted(ui, format!("…and {} more.", preview.rejected.len() - 8));
-                }
-            }
-        });
+        column = column.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .child(components::section_title("Preview", palette.text))
+                .child(components::muted(
+                    format!(
+                        "{} accepted · {} duplicate(s) · {} rejected",
+                        preview.accepted.len(),
+                        preview.duplicates.len(),
+                        preview.rejected.len()
+                    ),
+                    palette.text_muted,
+                ))
+                .children(preview.rejected.iter().take(5).map(|(line, reason)| {
+                    components::muted(format!("{line}: {reason}"), palette.danger)
+                })),
+        );
     }
 
-    if let Some(outcome) = app.add.outcome.clone() {
-        ui.add_space(theme::SPACE_2);
-        components::card_for(ui).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            components::section_heading(ui, "Result");
-            ui.add_space(theme::SPACE_1);
-            let accent = if outcome.failed.is_empty() {
-                palette.success
-            } else {
-                palette.warning
-            };
-            ui.horizontal(|ui| {
-                components::status_badge(
-                    ui,
-                    &format!("{} added · {} started", outcome.added, outcome.started),
-                    accent,
-                );
-                if outcome.added > 0 && components::button(ui, "Open Queue", Action::Info).clicked()
-                {
-                    app.navigate_to(Page::Queue);
-                }
-            });
+    if let Some(outcome) = &app.add.outcome {
+        column = column.child(components::muted(
+            format!(
+                "Added {} download(s); {} failed.",
+                outcome.added,
+                outcome.failed.len()
+            ),
+            palette.text_muted,
+        ));
+    }
 
-            if !outcome.failed.is_empty() {
-                ui.add_space(theme::SPACE_2);
-                for (url, reason) in outcome.failed.iter().take(8) {
-                    ui.label(
-                        RichText::new(format!("Failed — {} — {reason}", redact_url(url)))
-                            .size(theme::SMALL_SIZE)
-                            .color(palette.error),
-                    );
-                }
-                if outcome.failed.len() > 8 {
-                    components::muted(
-                        ui,
-                        format!("…and {} more failure(s).", outcome.failed.len() - 8),
-                    );
-                }
-            }
-        });
+    column
+}
+
+fn destination_label(app: &App) -> String {
+    match app.add.effective_destination(&app.settings) {
+        Some(path) => path.to_string_lossy().into_owned(),
+        None => "Default download folder".to_string(),
     }
 }
 
-/// Validate the form and hand the batch to the backend.
-fn submit(app: &mut BulkDownloadApp) {
-    let destination = app.add.effective_destination(&app.settings);
-    if destination.is_none() {
-        app.toast(Severity::Warning, NO_DESTINATION);
-        return;
-    }
-
-    let filename = single_override(&app.add.filename_override);
-    let checksum = single_override(&app.add.checksum);
-    app.add.error = None;
-    app.add.outcome = None;
-    app.add.add_pending = true;
-    app.send(Command::AddUrls {
-        text: app.add.urls_text.clone(),
-        destination: app.add.destination.clone(),
-        filename,
-        checksum,
-        start_now: app.add.start_immediately,
-    });
-}
-
-/// Append the contents of a picked `.txt` file to the URL editor.
-fn import_text_file(app: &mut BulkDownloadApp) {
-    let Some(path) = rfd::FileDialog::new()
-        .add_filter("Text files", &["txt"])
-        .pick_file()
-    else {
-        return;
-    };
-
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => {
-            let trimmed = contents.trim_end();
-            if trimmed.is_empty() {
-                app.toast(Severity::Info, "The selected file is empty.");
-                return;
-            }
-            if !app.add.urls_text.is_empty() && !app.add.urls_text.ends_with('\n') {
-                app.add.urls_text.push('\n');
-            }
-            app.add.urls_text.push_str(trimmed);
-            app.add.urls_text.push('\n');
-            app.add.clear_feedback();
-        }
-        Err(error) => app.toast(
-            Severity::Error,
-            format!("Could not read {}: {error}", path.display()),
-        ),
-    }
-}
-
-/// Keep the single-URL rule in sync with the text box.
-fn track_single_url(app: &mut BulkDownloadApp) {
-    let count = app
-        .add
-        .urls_text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count();
-    if count != app.add_line_count {
-        app.add_line_count = count;
-        // A filename or checksum must never leak onto a different batch.
-        if count != 1 {
-            app.add.filename_override.clear();
-            app.add.checksum.clear();
-        }
-    }
-}
-
-/// Trim an optional override; an empty box means "no override".
-fn single_override(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+fn count_lines(text: &str) -> usize {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .count()
 }

@@ -1,388 +1,221 @@
-//! History: paged, filtered, sortable list of settled downloads.
+//! History: search, sort, page through finished transfers.
 
-use egui::{RichText, Ui};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::input::Input;
+use gpui_kit::component::{Disableable as _, IconName};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 
-use crate::app::state::{Confirmation, HistoryState};
-use crate::app::theme::{self, Palette};
-use crate::app::{BulkDownloadApp, components, format};
-use crate::database::repository::HISTORY_STATES;
-use crate::models::diagnostic::host_from_url;
+use super::{App, components, format, theme};
+use crate::app::backend::{Command, QueueAction};
+use crate::app::state::Confirmation;
 use crate::models::download_status::DownloadState;
-use crate::services::validation::redact_url;
 
-pub fn show(app: &mut BulkDownloadApp, ui: &mut Ui) {
-    let palette = theme::palette(ui);
-    components::page_header(
-        ui,
-        "History",
-        "Completed and failed downloads, searchable",
-        None,
-    );
+pub fn show(app: &App, window: &mut Window, cx: &mut Context<App>) -> impl IntoElement {
+    let palette = theme::palette(window, cx);
+    let records = &app.history.records;
 
-    toolbar(app, ui, palette);
-    ui.add_space(theme::SPACE_2);
-    table(app, ui, palette);
-    ui.add_space(theme::SPACE_2);
-    pagination(app, ui);
-}
-
-/// Search, status filter, refresh and the destructive clear action.
-fn toolbar(app: &mut BulkDownloadApp, ui: &mut Ui, palette: Palette) {
-    let mut commit_search = false;
-
-    components::card_for(ui).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal_wrapped(|ui| {
-            let response = components::search_input(
-                ui,
-                &mut app.history.search_input,
-                "Search by name or URL",
-                300.0,
-            );
-            commit_search |=
-                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-
-            if components::secondary_button(ui, "Search").clicked() {
-                commit_search = true;
-            }
-
-            let mut chosen = app
-                .history
-                .query
-                .state
-                .as_deref()
-                .and_then(DownloadState::parse);
-            let before = chosen;
-            egui::ComboBox::from_id_salt("history_state_filter")
-                .selected_text(match chosen {
-                    Some(state) => theme::state_label(state),
-                    None => "All states",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut chosen, None, "All states");
-                    for state in HISTORY_STATES {
-                        ui.selectable_value(&mut chosen, Some(state), theme::state_label(state));
-                    }
-                });
-            if chosen != before {
-                app.history.set_state_filter(chosen);
-                app.request_history();
-            }
-
-            if components::secondary_button(ui, "Refresh").clicked() {
-                app.request_history();
-            }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if components::danger_button(ui, "Clear history…").clicked() {
-                    app.confirm(Confirmation::ClearHistory);
-                }
-            });
-        });
-
-        if let Some(search) = app.history.query.search.as_deref() {
-            ui.add_space(theme::SPACE_1);
-            components::muted(ui, format!("Searching for “{search}”."));
-        }
-        if let Some(state) = app
-            .history
-            .query
-            .state
-            .as_deref()
-            .and_then(DownloadState::parse)
-        {
-            ui.add_space(theme::SPACE_1);
-            components::muted(
-                ui,
-                format!("Showing {} rows only.", theme::state_label(state)),
-            );
-        }
-    });
-
-    if commit_search {
-        app.history.apply_search();
-        app.request_history();
-    }
-
-    if let Some(error) = &app.history.error {
-        ui.add_space(theme::SPACE_1);
-        ui.label(
-            RichText::new(error)
-                .size(theme::SMALL_SIZE)
-                .color(palette.error),
-        );
-    }
-}
-
-/// Grid of settled downloads with sortable headers.
-fn table(app: &mut BulkDownloadApp, ui: &mut Ui, palette: Palette) {
-    let mut reload = false;
-    let records = app.history.records.clone();
-
-    components::card_for(ui).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-
-        if records.is_empty() {
-            if app.history.loading {
-                components::empty_state_action(
-                    ui,
-                    "Loading history…",
-                    "Reading settled downloads from the local database.",
-                    "",
-                );
-                return;
-            }
-            if app.history.error.is_some() {
-                components::empty_state_action(
-                    ui,
-                    "History unavailable",
-                    "The history query failed. Check the message above, then refresh.",
-                    "",
-                );
-                return;
-            }
-
-            let has_search = app.history.query.search.is_some();
-            let has_filter = app.history.query.state.is_some();
-            let clicked = if has_search {
-                components::empty_state_action(
-                    ui,
-                    "No matching history",
-                    "No settled download matches the current search and filter.",
-                    "Clear search",
-                )
-            } else if has_filter {
-                components::empty_state_action(
-                    ui,
-                    "No history in this state",
-                    "No settled download has the selected status. Show all states to see the rest.",
-                    "Show all states",
-                )
-            } else {
-                components::empty_state_action(
-                    ui,
-                    "No history yet",
-                    "Completed, failed, cancelled and interrupted downloads appear here automatically.",
-                    "",
-                )
+    let filters = [
+        ("All", None),
+        ("Completed", Some(DownloadState::Completed)),
+        ("Failed", Some(DownloadState::Failed)),
+        ("Cancelled", Some(DownloadState::Cancelled)),
+        ("Interrupted", Some(DownloadState::Interrupted)),
+    ];
+    let current = app.history.query.state.as_deref();
+    let filter_bar = div()
+        .flex()
+        .flex_wrap()
+        .gap(px(6.0))
+        .children(filters.iter().map(|(label, state)| {
+            let active = match (current, state) {
+                (None, None) => true,
+                (Some(value), Some(expected)) => value == expected.as_str(),
+                _ => false,
             };
+            let label = *label;
+            let state = *state;
+            Button::new(format!("history-filter-{label}"))
+                .label(label)
+                .when(active, |button| button.primary())
+                .when(!active, |button| button.ghost())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.history.set_state_filter(state);
+                    this.request_history();
+                    cx.notify();
+                }))
+        }));
 
-            if clicked {
-                if has_search {
-                    app.history.search_input.clear();
-                    app.history.apply_search();
-                } else if has_filter {
-                    app.history.set_state_filter(None);
-                }
-                app.request_history();
-            }
-            return;
-        }
-
-        egui::ScrollArea::horizontal()
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                egui::Grid::new("history_rows")
-                    .num_columns(9)
-                    .spacing([14.0, 8.0])
-                    .striped(true)
-                    .show(ui, |ui| {
-                        reload |= sort_header(ui, &mut app.history, "Name", "display_name", palette);
-                        header(ui, "Host", palette);
-                        reload |=
-                            sort_header(ui, &mut app.history, "Status", "state", palette);
-                        reload |= sort_header(
-                            ui,
-                            &mut app.history,
-                            "Downloaded",
-                            "downloaded_bytes",
-                            palette,
-                        );
-                        reload |= sort_header(
-                            ui,
-                            &mut app.history,
-                            "Size",
-                            "expected_size",
-                            palette,
-                        );
-                        reload |= sort_header(
-                            ui,
-                            &mut app.history,
-                            "Started",
-                            "created_at",
-                            palette,
-                        );
-                        reload |= sort_header(
-                            ui,
-                            &mut app.history,
-                            "Completed",
-                            "completed_at",
-                            palette,
-                        );
-                        reload |=
-                            sort_header(ui, &mut app.history, "Retries", "retry_count", palette);
-                        header(ui, "Error", palette);
-                        ui.end_row();
-
-                        for record in &records {
-                            components::ellipsized_width(
-                                ui,
-                                RichText::new(&record.display_name).color(palette.text),
-                                &redact_url(&record.source_url),
-                                220.0,
-                            );
-
-                            let host = host_from_url(&record.source_url);
-                            ui.label(
-                                RichText::new(if host.is_empty() {
-                                    format::DASH.to_string()
-                                } else {
-                                    host
-                                })
-                                .size(theme::SMALL_SIZE)
-                                .color(palette.muted),
-                            )
-                            .on_hover_text(redact_url(&record.source_url));
-
-                            components::status_badge(
-                                ui,
-                                theme::state_label(record.state),
-                                palette.state_color(record.state),
-                            );
-
-                            ui.label(
-                                RichText::new(format::format_bytes(Some(
-                                    record.downloaded_bytes,
-                                )))
-                                .color(palette.text),
-                            );
-                            ui.label(
-                                RichText::new(format::format_bytes(record.expected_size))
-                                    .color(palette.muted),
-                            );
-                            ui.label(
-                                RichText::new(format::short_timestamp(&record.created_at))
-                                    .color(palette.muted)
-                                    .size(theme::SMALL_SIZE),
-                            );
-                            ui.label(
-                                RichText::new(
-                                    record
-                                        .completed_at
-                                        .as_deref()
-                                        .map(format::short_timestamp)
-                                        .unwrap_or_else(|| format::DASH.to_string()),
-                                )
-                                .color(palette.muted)
-                                .size(theme::SMALL_SIZE),
-                            );
-                            ui.label(
-                                RichText::new(record.retry_count.to_string())
-                                    .color(palette.muted)
-                                    .size(theme::SMALL_SIZE),
-                            );
-
-                            components::ellipsized_width(
-                                ui,
-                                RichText::new(
-                                    record.error_summary.as_deref().unwrap_or(format::DASH),
-                                )
-                                .color(if record.failure_category.is_some() {
-                                    palette.error
-                                } else {
-                                    palette.muted
-                                })
-                                .size(theme::SMALL_SIZE),
-                                record.error_summary.as_deref().unwrap_or_default(),
-                                260.0,
-                            );
-                            ui.end_row();
-                        }
-                    });
-            });
-    });
-
-    if reload {
-        app.request_history();
-    }
-}
-
-/// Non-sortable column header.
-fn header(ui: &mut Ui, label: &str, palette: Palette) {
-    ui.label(
-        RichText::new(label)
-            .size(theme::SMALL_SIZE)
-            .strong()
-            .color(palette.text_secondary),
-    );
-}
-
-/// Render a clickable sortable column header; `true` when the order changed.
-fn sort_header(
-    ui: &mut Ui,
-    history: &mut HistoryState,
-    label: &str,
-    column: &str,
-    palette: Palette,
-) -> bool {
-    let active = history.query.sort_by == column;
-    let arrow = if !active {
-        ""
-    } else if history.query.sort_dir.eq_ignore_ascii_case("ASC") {
-        " ▲"
-    } else {
-        " ▼"
-    };
-    let text = format!("{label}{arrow}");
-    let response = ui
-        .add(
-            egui::Button::new(RichText::new(text).size(theme::SMALL_SIZE).strong().color(
-                if active {
-                    palette.text
-                } else {
-                    palette.text_secondary
-                },
-            ))
-            .frame(false),
+    let header = div()
+        .flex()
+        .gap(px(8.0))
+        .items_center()
+        .child(
+            div()
+                .w(px(260.0))
+                .child(Input::new(&app.history_search)),
         )
-        .on_hover_text(format!("Sort by {label}"));
-    if response.clicked() {
-        history.toggle_sort(column);
-        true
-    } else {
-        false
-    }
-}
-
-/// Repository-backed paging controls.
-fn pagination(app: &mut BulkDownloadApp, ui: &mut Ui) {
-    components::card_for(ui).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            let can_go_back = app.history.query.offset > 0;
-            ui.add_enabled_ui(can_go_back, |ui| {
-                if components::secondary_button(ui, "◀ Previous").clicked() {
-                    app.history.previous_page();
-                    app.request_history();
-                }
-            });
-            components::muted(ui, format!("Page {}", app.history.page_number()));
-
-            let has_next = app.history.has_next_page();
-            ui.add_enabled_ui(has_next, |ui| {
-                if components::secondary_button(ui, "Next ▶").clicked() {
-                    app.history.next_page();
-                    app.request_history();
-                }
-            });
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                components::muted(ui, format!("{} row(s)", app.history.records.len()));
-            });
-        });
-        components::muted(
-            ui,
-            "Clear history deletes at most 100 records per pass; the app repeats until nothing is left.",
+        .child(
+            Button::new("history-search")
+                .icon(IconName::Search)
+                .label("Search")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let text = this.history_search.read(cx).value().to_string();
+                    this.history.search_input = text;
+                    this.history.apply_search();
+                    this.request_history();
+                    cx.notify();
+                })),
+        )
+        .child(
+            Button::new("history-refresh")
+                .ghost()
+                .label("Refresh")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.request_history();
+                    cx.notify();
+                })),
         );
+
+    let rows = records.iter().map(|record| {
+        let id = record.id.unwrap_or(-1);
+        let checked = app.history.selected.contains(&id);
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(palette.border)
+            .bg(palette.surface)
+            .p(px(10.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(
+                        Checkbox::new(format!("history-select-{id}"))
+                            .checked(checked)
+                            .accessibility_label("Select history record")
+                            .on_change(cx.listener(move |this, value, _, cx| {
+                                if *value {
+                                    this.history.selected.insert(id);
+                                } else {
+                                    this.history.selected.remove(&id);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().flex_1().child(record.display_name.clone()))
+                    .child(components::badge(
+                        theme::state_label(record.state),
+                        theme::state_color(record.state, palette),
+                        palette,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .text_size(px(11.0))
+                    .text_color(palette.text_muted)
+                    .child(format::format_bytes(Some(record.downloaded_bytes)))
+                    .child(record.completed_at.clone().unwrap_or_else(|| "—".into())),
+            )
+            .when_some(record.error_summary.clone(), |el, error| {
+                el.child(components::muted(error, palette.danger))
+            })
     });
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(14.0))
+        .child(components::page_header(
+            "History",
+            "Search finished downloads and retry failures.",
+        ))
+        .child(header)
+        .child(filter_bar)
+        .children(rows)
+        .when(records.is_empty(), |el| {
+            el.child(components::empty_state(
+                "No history yet",
+                "Completed and failed downloads appear here.",
+                palette,
+            ))
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    Button::new("history-prev")
+                        .ghost()
+                        .label("Previous")
+                        .disabled(app.history.query.offset == 0)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.history.previous_page();
+                            this.request_history();
+                            cx.notify();
+                        })),
+                )
+                .child(components::muted(
+                    format!("Page {}", app.history.page_number()),
+                    palette.text_muted,
+                ))
+                .child(
+                    Button::new("history-next")
+                        .ghost()
+                        .label("Next")
+                        .disabled(!app.history.has_next_page())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.history.next_page();
+                            this.request_history();
+                            cx.notify();
+                        })),
+                )
+                .child(div().flex_1())
+                .child(
+                    Button::new("history-retry")
+                        .label("Retry failed")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let ids: Vec<i64> = this
+                                .history
+                                .records
+                                .iter()
+                                .filter(|record| record.state == DownloadState::Failed)
+                                .filter_map(|record| record.id)
+                                .collect();
+                            if !ids.is_empty() {
+                                this.send(Command::QueueAction {
+                                    ids,
+                                    action: QueueAction::Retry,
+                                });
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Checkbox::new("history-delete-files")
+                        .label("Also delete downloaded files")
+                        .checked(app.history.keep_files_on_clear)
+                        .on_change(cx.listener(|this, value, _, cx| {
+                            this.history.keep_files_on_clear = *value;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("history-clear")
+                        .danger()
+                        .label("Clear history…")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.confirm(Confirmation::ClearHistory);
+                            cx.notify();
+                        })),
+                ),
+        )
 }
