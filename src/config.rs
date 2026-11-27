@@ -5,7 +5,7 @@
 //! serialisation matches the original to_json/from_json pair so a database
 //! written by the Python app can be read back here.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -190,7 +190,9 @@ impl Settings {
     /// object keys are sorted (serde_json maps are BTreeMaps).
     pub fn to_json(&self) -> String {
         let value = serde_json::to_value(self).expect("settings serialise infallibly");
-        serde_json::to_string(&value).expect("settings serialise infallibly")
+        let object = value.as_object().expect("settings serialize to an object");
+        let sorted: BTreeMap<&String, &serde_json::Value> = object.iter().collect();
+        serde_json::to_string(&sorted).expect("settings serialise infallibly")
     }
 
     /// Rebuild settings from a stored JSON document.

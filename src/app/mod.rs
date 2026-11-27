@@ -1,23 +1,25 @@
-//! Desktop UI layer built on egui/eframe.
+//! GPUI desktop UI layer.
 //!
 //! The UI is deliberately split from the download engine: every side effect
 //! goes through [`backend::AppBackend`], and the UI only renders state and
-//! sends commands. This keeps the rendering path free of I/O and makes the
-//! data layer testable without a window.
+//! sends commands. The root view owns all UI state; the backend pushes
+//! [`UiEvent`]s into a channel that the view drains on a short timer.
 
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use egui::{
-    Align2, Color32, CornerRadius, FontId, Margin, Rect, Response, RichText, Sense, Stroke, Ui,
-    UiBuilder, pos2, vec2,
-};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{InputState, TextareaState};
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 
 use crate::app::backend::{AppBackend, Command, QueueAction, Startup, UiEvent};
 use crate::app::state::{
     AddDownloadsState, AiFinderState, Confirmation, DashboardState, DiscoveryState, HistoryState,
-    Page, QueueState, SettingsState, Severity,
+    Notifications, Page, QueueState, SettingsState, Severity,
 };
+use crate::app::theme::Palette;
 use crate::config::Settings;
 use crate::models::download_status::DownloadState;
 
@@ -34,75 +36,101 @@ pub mod settings_view;
 pub mod state;
 pub mod theme;
 
-/// Left navigation width.
-const NAV_WIDTH: f32 = 220.0;
-/// Bottom status bar height.
-const STATUS_HEIGHT: f32 = 30.0;
-/// Margin between the window edge and the floating glass panel.
-const PANEL_MARGIN: f32 = 14.0;
-/// Corner radius of the floating glass panel.
-const PANEL_RADIUS: u8 = 18;
-/// Maximum width of the page content column; wider windows centre it.
-const CONTENT_MAX_WIDTH: f32 = 1180.0;
-
-/// The root application: owns the UI state and talks to the backend actor.
-pub struct BulkDownloadApp {
-    pub(crate) backend: AppBackend,
-    pub(crate) events: Receiver<UiEvent>,
-    pub(crate) settings: Settings,
-    pub(crate) page: Page,
-    pub(crate) queue: QueueState,
-    pub(crate) history: HistoryState,
-    pub(crate) discovery: DiscoveryState,
-    pub(crate) ai: AiFinderState,
-    pub(crate) add: AddDownloadsState,
-    pub(crate) settings_state: SettingsState,
-    pub(crate) dashboard: DashboardState,
-    pub(crate) notifications: state::Notifications,
-    pub(crate) confirmation: Option<Confirmation>,
-    pub(crate) settings_error: Option<String>,
-    /// Folder picked on the Discover page; falls back to the configured one.
-    pub(crate) discovery_destination: Option<std::path::PathBuf>,
-    /// Folder picked on the AI File Finder page; falls back to the configured one.
-    pub(crate) ai_destination: Option<std::path::PathBuf>,
-    /// Line count of the URL box on the previous frame; used to clear the
-    /// single-URL overrides when the batch size changes.
-    pub(crate) add_line_count: usize,
-    pub(crate) history_dirty: bool,
-    pub(crate) dashboard_dirty: bool,
-    /// Set once the user has accepted the quit-with-active confirmation.
-    pub(crate) quit_requested: bool,
-    /// Guards against prompting twice for recovered downloads.
-    pub(crate) recovered_prompted: bool,
-    /// False once the backend event channel disconnects. The sidebar only
-    /// reports connectivity it can actually observe.
+/// Root GPUI view: owns the backend handle and all UI state.
+pub struct App {
+    backend: AppBackend,
+    events: Receiver<UiEvent>,
     events_connected: bool,
-    /// Timestamp of the previous frame, for toast countdowns.
-    last_tick: std::time::Instant,
+    settings: Settings,
+    page: Page,
+    queue: QueueState,
+    history: HistoryState,
+    discovery: DiscoveryState,
+    ai: AiFinderState,
+    add: AddDownloadsState,
+    settings_state: SettingsState,
+    dashboard: DashboardState,
+    notifications: Notifications,
+    confirmation: Option<Confirmation>,
+    settings_error: Option<String>,
+    discovery_destination: Option<std::path::PathBuf>,
+    ai_destination: Option<std::path::PathBuf>,
+    add_line_count: usize,
+    history_dirty: bool,
+    dashboard_dirty: bool,
+    quit_requested: bool,
+    recovered_prompted: bool,
+    last_tick: Instant,
+
+    pub(crate) add_urls: Entity<TextareaState>,
+    pub(crate) add_filename: Entity<InputState>,
+    pub(crate) add_checksum: Entity<InputState>,
+    pub(crate) discovery_url: Entity<InputState>,
+    pub(crate) ai_urls: Entity<TextareaState>,
+    pub(crate) history_search: Entity<InputState>,
+
+    pub(crate) set_destination: Entity<InputState>,
+    pub(crate) set_max_simultaneous: Entity<InputState>,
+    pub(crate) set_timeout: Entity<InputState>,
+    pub(crate) set_retry_count: Entity<InputState>,
+    pub(crate) set_retry_delay: Entity<InputState>,
+    pub(crate) set_buffer_size: Entity<InputState>,
+    pub(crate) set_bandwidth: Entity<InputState>,
+    pub(crate) set_user_agent: Entity<InputState>,
+    pub(crate) set_extensions: Entity<InputState>,
+    pub(crate) set_ad_hosts: Entity<InputState>,
+
+    _subscriptions: Vec<Subscription>,
 }
 
-impl BulkDownloadApp {
-    /// Build the app around an already-started backend.
+impl App {
     pub fn new(
-        cc: &eframe::CreationContext<'_>,
         backend: AppBackend,
         startup: Startup,
         events: Receiver<UiEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> Self {
-        theme::apply(&cc.egui_ctx);
+        let add_urls = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(5)
+                .placeholder("One download URL per line…")
+        });
+        let add_filename = cx.new(|cx| InputState::new(window, cx).placeholder("Optional file name"));
+        let add_checksum = cx.new(|cx| InputState::new(window, cx).placeholder("sha256:<hex>"));
+        let discovery_url = cx.new(|cx| InputState::new(window, cx).placeholder("https://example.com/page"));
+        let ai_urls = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(4)
+                .placeholder("Paste URLs to inspect…")
+        });
+        let history_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search files, paths, URLs"));
+
+        let set_destination = cx.new(|cx| InputState::new(window, cx).placeholder("Default download folder"));
+        let set_max_simultaneous = cx.new(|cx| InputState::new(window, cx).placeholder("1–10"));
+        let set_timeout = cx.new(|cx| InputState::new(window, cx).placeholder("Seconds"));
+        let set_retry_count = cx.new(|cx| InputState::new(window, cx).placeholder("0–20"));
+        let set_retry_delay = cx.new(|cx| InputState::new(window, cx).placeholder("Seconds"));
+        let set_buffer_size = cx.new(|cx| InputState::new(window, cx).placeholder("Bytes"));
+        let set_bandwidth = cx.new(|cx| InputState::new(window, cx).placeholder("KB/s, 0 = unlimited"));
+        let set_user_agent = cx.new(|cx| InputState::new(window, cx).placeholder("User-Agent"));
+        let set_extensions = cx.new(|cx| InputState::new(window, cx).placeholder("zip, pdf, mp4"));
+        let set_ad_hosts = cx.new(|cx| InputState::new(window, cx).placeholder("tracker.example.com"));
 
         let mut settings_state = SettingsState::default();
         settings_state.load(startup.settings.clone());
 
         let recovered = startup.recovered.len();
-        let mut confirmation = None;
-        if recovered > 0 {
-            confirmation = Some(Confirmation::ResumeInterrupted { count: recovered });
-        }
+        let confirmation = if recovered > 0 {
+            Some(Confirmation::ResumeInterrupted { count: recovered })
+        } else {
+            None
+        };
 
-        let app = Self {
+        let mut app = Self {
             backend,
             events,
+            events_connected: true,
             settings: startup.settings,
             page: Page::Dashboard,
             queue: QueueState::default(),
@@ -112,7 +140,7 @@ impl BulkDownloadApp {
             add: AddDownloadsState::new(),
             settings_state,
             dashboard: DashboardState::default(),
-            notifications: state::Notifications::default(),
+            notifications: Notifications::default(),
             confirmation,
             settings_error: startup.settings_error,
             discovery_destination: None,
@@ -122,16 +150,56 @@ impl BulkDownloadApp {
             dashboard_dirty: true,
             quit_requested: false,
             recovered_prompted: recovered > 0,
-            events_connected: true,
-            last_tick: std::time::Instant::now(),
+            last_tick: Instant::now(),
+            add_urls,
+            add_filename,
+            add_checksum,
+            discovery_url,
+            ai_urls,
+            history_search,
+            set_destination,
+            set_max_simultaneous,
+            set_timeout,
+            set_retry_count,
+            set_retry_delay,
+            set_buffer_size,
+            set_bandwidth,
+            set_user_agent,
+            set_extensions,
+            set_ad_hosts,
+            _subscriptions: Vec::new(),
         };
 
-        app.backend.send(Command::LoadQueue);
-        app.backend.send(Command::RefreshDashboard);
+        app.sync_settings_inputs(window, cx);
+        app.send(Command::LoadQueue);
+        app.send(Command::RefreshDashboard);
+
+        cx.spawn(|weak: WeakEntity<App>, cx: &mut AsyncApp| {
+            let cx = cx.clone();
+            async move {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(150))
+                    .await;
+                let alive = cx.update(|app| {
+                    weak.update(app, |this, view_cx| {
+                        this.tick();
+                        view_cx.notify();
+                    })
+                    .is_ok()
+                });
+                if !alive {
+                    break;
+                }
+            }
+            }
+        })
+        .detach();
+
         app
     }
 
-    // ---- helpers used by the pages ---------------------------------------
+    // ---- helpers used by page views ---------------------------------------
 
     pub(crate) fn send(&self, command: Command) {
         self.backend.send(command);
@@ -141,52 +209,97 @@ impl BulkDownloadApp {
         self.notifications.push(severity, text);
     }
 
-    /// Ask the backend for the current history page.
+    /// Push the current settings into the retained text inputs.
+    pub(crate) fn sync_settings_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let settings = self.settings.clone();
+        let values = [
+            (&self.set_destination, settings.default_destination_dir.clone()),
+            (&self.set_max_simultaneous, settings.max_simultaneous.to_string()),
+            (&self.set_timeout, settings.connection_timeout.to_string()),
+            (&self.set_retry_count, settings.retry_count.to_string()),
+            (&self.set_retry_delay, settings.retry_delay.to_string()),
+            (&self.set_buffer_size, settings.buffer_size.to_string()),
+            (
+                &self.set_bandwidth,
+                (settings.bandwidth_limit_bps as f64 / 1024.0).to_string(),
+            ),
+            (&self.set_user_agent, settings.user_agent.clone()),
+            (
+                &self.set_extensions,
+                settings
+                    .allowed_extensions
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            (&self.set_ad_hosts, settings.ad_filter_list_path.clone()),
+        ];
+        for (input, value) in values {
+            input.update(cx, |state, cx| state.set_value(value, window, cx));
+        }
+        self.settings_state.load(settings);
+    }
+
     pub(crate) fn request_history(&mut self) {
         self.history.loading = true;
         self.history_dirty = false;
-        self.backend.send(Command::LoadHistory {
+        self.send(Command::LoadHistory {
             query: self.history.to_query(),
         });
     }
 
     pub(crate) fn request_dashboard(&mut self) {
         self.dashboard_dirty = false;
-        self.backend.send(Command::RefreshDashboard);
+        self.send(Command::RefreshDashboard);
     }
 
     pub(crate) fn confirm(&mut self, confirmation: Confirmation) {
         self.confirmation = Some(confirmation);
     }
 
-    /// Navigate to another page from a page-level action.
-    pub(crate) fn navigate_to(&mut self, page: Page) {
-        self.switch_page(page);
+    pub(crate) fn switch_page(&mut self, page: Page) {
+        if self.page == page {
+            return;
+        }
+        self.page = page;
+        match page {
+            Page::History => self.request_history(),
+            Page::Dashboard => self.request_dashboard(),
+            Page::AiFinder => self.send(Command::LoadAnalysis),
+            _ => {}
+        }
     }
 
-    fn last_tick(&self) -> std::time::Instant {
-        self.last_tick
-    }
-
-    fn mark_tick(&mut self, now: std::time::Instant) {
-        self.last_tick = now;
-    }
-
-    /// Number of rows currently holding a worker slot.
     pub(crate) fn active_count(&self) -> usize {
         self.queue
             .records()
             .iter()
-            .filter(|record| state::is_active(record.state))
+            .filter(|record| theme::is_active(record.state))
             .count()
+    }
+
+    fn total_speed(&self) -> f64 {
+        self.queue
+            .records()
+            .iter()
+            .filter(|record| theme::is_active(record.state))
+            .filter_map(|record| self.queue.progress_for(record))
+            .map(|progress| progress.speed_bps)
+            .sum()
     }
 
     // ---- event pump -------------------------------------------------------
 
-    fn drain_events(&mut self, ctx: &egui::Context) {
+    fn tick(&mut self) {
+        let now = Instant::now();
+        let delta = now - self.last_tick;
+        self.last_tick = now;
+        self.notifications.tick(delta);
+
         loop {
             match self.events.try_recv() {
-                Ok(event) => self.apply_event(event, ctx),
+                Ok(event) => self.apply_event(event),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.events_connected = false;
@@ -194,28 +307,30 @@ impl BulkDownloadApp {
                 }
             }
         }
+
+        if self.dashboard_dirty && self.page == Page::Dashboard {
+            self.request_dashboard();
+        }
+        if self.history_dirty && self.page == Page::History {
+            self.request_history();
+        }
     }
 
-    fn apply_event(&mut self, event: UiEvent, ctx: &egui::Context) {
+    fn apply_event(&mut self, event: UiEvent) {
         match event {
             UiEvent::Progress(progress) => {
-                // The engine snapshot and the UI model are deliberately
-                // separate types; mirror the fields across the boundary.
-                self.queue
-                    .apply_progress(crate::models::download_status::DownloadProgress {
-                        download_id: progress.download_id,
-                        downloaded_bytes: progress.downloaded_bytes,
-                        total_bytes: progress.total_bytes,
-                        speed_bps: progress.speed_bps,
-                        eta_seconds: progress.eta_seconds,
-                    });
+                self.queue.apply_progress(crate::models::download_status::DownloadProgress {
+                    download_id: progress.download_id,
+                    downloaded_bytes: progress.downloaded_bytes,
+                    total_bytes: progress.total_bytes,
+                    speed_bps: progress.speed_bps,
+                    eta_seconds: progress.eta_seconds,
+                });
             }
             UiEvent::StateChanged(record) => {
                 let record = *record;
                 if record.state.is_terminal() {
                     self.history_dirty = true;
-                }
-                if self.page == Page::Dashboard {
                     self.dashboard_dirty = true;
                 }
                 self.queue.upsert(record);
@@ -329,7 +444,6 @@ impl BulkDownloadApp {
                 Ok(settings) => {
                     self.settings = settings.clone();
                     self.settings_state.mark_saved(settings);
-                    apply_theme(ctx, self.settings.theme);
                     self.toast(Severity::Success, "Settings saved.");
                 }
                 Err(message) => {
@@ -337,21 +451,17 @@ impl BulkDownloadApp {
                     self.toast(Severity::Error, message);
                 }
             },
-            UiEvent::HistoryCleared { removed, error } => {
-                match error {
-                    Some(message) => self.toast(Severity::Error, message),
-                    None => self.toast(
-                        if removed == 0 {
-                            Severity::Info
-                        } else {
-                            Severity::Success
-                        },
-                        format!("Cleared {removed} history record(s)."),
-                    ),
-                }
-                self.history_dirty = true;
-                self.dashboard_dirty = true;
-            }
+            UiEvent::HistoryCleared { removed, error } => match error {
+                Some(message) => self.toast(Severity::Error, message),
+                None => self.toast(
+                    if removed == 0 {
+                        Severity::Info
+                    } else {
+                        Severity::Success
+                    },
+                    format!("Cleared {removed} history record(s)."),
+                ),
+            },
             UiEvent::Error(message) => {
                 self.add.error = Some(message.clone());
                 self.add.preview_pending = false;
@@ -359,252 +469,24 @@ impl BulkDownloadApp {
                 self.toast(Severity::Error, message);
             }
         }
-        ctx.request_repaint();
     }
 
-    // ---- shell ------------------------------------------------------------
-
-    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (switch, quit) = ctx.input(|input| {
-            let command = input.modifiers.command;
-            let switch = Page::ALL
-                .iter()
-                .enumerate()
-                .find(|(index, _)| {
-                    command
-                        && input.key_pressed(match index {
-                            0 => egui::Key::Num1,
-                            1 => egui::Key::Num2,
-                            2 => egui::Key::Num3,
-                            3 => egui::Key::Num4,
-                            4 => egui::Key::Num5,
-                            5 => egui::Key::Num6,
-                            _ => egui::Key::Num7,
-                        })
-                })
-                .map(|(_, page)| *page);
-            (switch, command && input.key_pressed(egui::Key::Q))
-        });
-
-        if let Some(page) = switch {
-            self.switch_page(page);
+    /// Returns true when the caller should close the application.
+    fn request_quit(&mut self) -> bool {
+        if self.quit_requested {
+            return true;
         }
-        if quit {
-            self.request_quit(ctx);
-        }
-        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) && self.confirmation.is_some() {
-            self.confirmation = None;
-        }
-    }
-
-    fn switch_page(&mut self, page: Page) {
-        if self.page == page {
-            return;
-        }
-        self.page = page;
-        match page {
-            Page::History => self.history_dirty = true,
-            Page::Dashboard => self.dashboard_dirty = true,
-            Page::Queue => self.backend.send(Command::LoadQueue),
-            Page::AiFinder => self.backend.send(Command::LoadAnalysis),
-            _ => {}
-        }
-    }
-
-    fn request_quit(&mut self, ctx: &egui::Context) {
         let active = self.active_count();
-        if active > 0 && !self.quit_requested {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if active > 0 {
             self.confirm(Confirmation::QuitWithActive { count: active });
+            false
         } else {
-            self.quit_requested = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            true
         }
     }
 
-    fn nav(&mut self, ui: &mut Ui) {
-        // The rail background is painted by the shell so it can follow the
-        // panel's rounded corners.
-        let palette = theme::palette(ui);
-
-        ui.add_space(theme::SPACE_5);
-        ui.horizontal(|ui| {
-            ui.add_space(theme::SPACE_4);
-            let (rect, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
-            paint_logo(ui.painter(), rect, palette);
-            ui.add_space(theme::SPACE_2);
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new("BulkDownloadManager")
-                        .size(13.5)
-                        .strong()
-                        .color(palette.text),
-                );
-                ui.label(
-                    RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                        .size(theme::SMALL_SIZE)
-                        .color(palette.muted),
-                );
-            });
-        });
-        ui.add_space(theme::SPACE_5);
-        separator(ui, palette);
-        ui.add_space(theme::SPACE_3);
-
-        let queued = self.queue.len();
-        let queue_badge = (queued > 0).then(|| {
-            if queued > 99 {
-                "99+".to_string()
-            } else {
-                queued.to_string()
-            }
-        });
-
-        for page in Page::ALL {
-            let badge = if page == Page::Queue {
-                queue_badge.as_deref()
-            } else {
-                None
-            };
-            let response = nav_item(ui, page, page == self.page, badge, palette);
-            if response.clicked() {
-                self.navigate_to(page);
-            }
-        }
-
-        let counts = self.queue.activity_counts();
-        let connected = self.events_connected;
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            ui.add_space(theme::SPACE_3);
-            ui.horizontal(|ui| {
-                ui.add_space(theme::SPACE_3);
-                activity_summary(ui, counts, palette);
-            });
-            ui.add_space(theme::SPACE_2);
-            ui.horizontal(|ui| {
-                ui.add_space(theme::SPACE_4);
-                let (rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-                let color = if connected {
-                    palette.success
-                } else {
-                    palette.error
-                };
-                ui.painter().circle_filled(rect.center(), 4.0, color);
-                ui.label(
-                    RichText::new(if connected {
-                        "Engine connected"
-                    } else {
-                        "Engine offline"
-                    })
-                    .size(theme::SMALL_SIZE)
-                    .color(palette.text_secondary),
-                );
-            });
-            ui.add_space(theme::SPACE_2);
-            separator(ui, palette);
-        });
-    }
-
-    fn status_bar(&mut self, ui: &mut Ui) {
-        // The strip background is painted by the shell so it can follow the
-        // panel's rounded corners.
-        let palette = theme::palette(ui);
-        let active = self.active_count();
-        let queued = self.queue.len();
-        let state = if active > 0 {
-            "Downloading"
-        } else if queued > 0 {
-            "Queued"
-        } else {
-            "Idle"
-        };
-
-        ui.horizontal_centered(|ui| {
-            ui.add_space(theme::SPACE_4);
-            ui.label(
-                RichText::new(format!("{} — {}", self.page.title(), state))
-                    .size(theme::SMALL_SIZE)
-                    .color(palette.muted),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Keep the rightmost label off the panel edge; the clip rect
-                // sits a few pixels inside the rounded silhouette.
-                ui.add_space(theme::SPACE_4);
-                ui.label(
-                    RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                        .size(theme::SMALL_SIZE)
-                        .color(palette.muted),
-                );
-                ui.label(
-                    RichText::new(format!("{queued} queued"))
-                        .size(theme::SMALL_SIZE)
-                        .color(palette.muted),
-                );
-                ui.label(
-                    RichText::new(format!("{active} active"))
-                        .size(theme::SMALL_SIZE)
-                        .color(if active > 0 {
-                            palette.accent
-                        } else {
-                            palette.muted
-                        }),
-                );
-            });
-        });
-    }
-
-    fn render_page(&mut self, ui: &mut Ui) {
-        match self.page {
-            Page::Dashboard => dashboard::show(self, ui),
-            Page::AddDownloads => add_downloads::show(self, ui),
-            Page::Discover => discover::show(self, ui),
-            Page::AiFinder => ai_file_finder::show(self, ui),
-            Page::Queue => queue_view::show(self, ui),
-            Page::History => history_view::show(self, ui),
-            Page::Settings => settings_view::show(self, ui),
-        }
-    }
-
-    fn render_confirmation(&mut self, ui: &mut Ui, full: Rect) {
-        let Some(confirmation) = self.confirmation.clone() else {
-            return;
-        };
-
-        let palette = theme::palette(ui);
-        ui.painter()
-            .rect_filled(full, CornerRadius::ZERO, palette.modal_scrim);
-
-        let width = 460.0;
-        let rect = Rect::from_center_size(full.center(), vec2(width, 230.0));
-        let mut result = components::DialogResult::default();
-
-        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            result = components::confirmation_dialog(
-                ui,
-                width,
-                confirmation.title(),
-                &confirmation.message(),
-                confirmation.accept_label(),
-                confirmation.is_destructive(),
-                |ui| {
-                    if confirmation == Confirmation::ClearHistory {
-                        ui.checkbox(
-                            &mut self.history.keep_files_on_clear,
-                            "Also delete downloaded files from disk",
-                        );
-                    }
-                },
-            );
-        });
-
-        if result.accepted {
-            self.accept_confirmation(confirmation, ui.ctx());
-        } else if result.cancelled {
-            self.confirmation = None;
-        }
-    }
-
-    fn accept_confirmation(&mut self, confirmation: Confirmation, ctx: &egui::Context) {
+    /// Returns true when the caller should close the application.
+    fn accept_confirmation(&mut self, confirmation: Confirmation) -> bool {
         self.confirmation = None;
         match confirmation {
             Confirmation::ResumeInterrupted { .. } => {
@@ -616,583 +498,260 @@ impl BulkDownloadApp {
                     .filter_map(|record| record.id)
                     .collect();
                 if ids.is_empty() {
-                    // The queue may not have loaded yet; retry the whole queue.
-                    self.backend.send(Command::StartAll);
+                    self.send(Command::StartAll);
                 } else {
-                    self.backend.send(Command::QueueAction {
+                    self.send(Command::QueueAction {
                         ids,
                         action: QueueAction::Resume,
                     });
                 }
             }
             Confirmation::ClearHistory => {
-                // The checkbox says "also delete files", the repository takes
-                // the opposite flag.
                 let keep_files = !self.history.keep_files_on_clear;
-                self.backend.send(Command::ClearHistory { keep_files });
+                self.send(Command::ClearHistory { keep_files });
             }
             Confirmation::QuitWithActive { .. } => {
                 self.quit_requested = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return true;
             }
             Confirmation::RemoveQueue { ids } => {
-                self.backend.send(Command::QueueAction {
+                self.send(Command::QueueAction {
                     ids,
                     action: QueueAction::Remove,
                 });
             }
             Confirmation::CancelQueue { ids } => {
-                self.backend.send(Command::QueueAction {
+                self.send(Command::QueueAction {
                     ids,
                     action: QueueAction::Cancel,
                 });
             }
         }
+        false
     }
+}
 
-    fn toasts(&mut self, ui: &mut Ui, full: Rect) {
-        if self.notifications.is_empty() {
-            return;
-        }
-        let width = 380.0;
-        // Reserve the strip above the status bar and anchor the stack to its
-        // bottom edge, so a wrapped (taller) toast grows upward and is never
-        // clipped at the window edge or painted over the status bar.
-        let area = Rect::from_min_max(
-            pos2(
-                full.right() - width - theme::SPACE_4,
-                full.top() + theme::SPACE_4,
-            ),
-            pos2(
-                full.right() - theme::SPACE_4,
-                full.bottom() - STATUS_HEIGHT - theme::SPACE_4,
-            ),
-        );
-        let items = self.notifications.items();
-        ui.scope_builder(UiBuilder::new().max_rect(area), |ui| {
-            ui.set_clip_rect(area);
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
-                for notification in items.iter().rev() {
-                    components::toast(ui, notification);
-                    ui.add_space(theme::SPACE_1);
-                }
-            });
-        });
-    }
+impl Render for App {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = theme::palette(window, cx);
 
-    fn schedule_repaint(&self, ctx: &egui::Context) {
-        let busy = self.queue.has_active()
-            || self.discovery.scanning
-            || self.ai.analyzing
-            || self.history.loading;
-        let delay = if busy {
-            Duration::from_millis(250)
-        } else {
-            match self.page {
-                Page::Queue => Duration::from_millis(500),
-                Page::Dashboard | Page::History => Duration::from_millis(1500),
-                Page::AddDownloads | Page::Discover | Page::AiFinder | Page::Settings => return,
-            }
+        let nav = div()
+            .w(px(210.0))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .border_r_1()
+            .border_color(palette.border)
+            .bg(palette.surface)
+            .p(px(12.0))
+            .child(
+                div()
+                    .px(px(8.0))
+                    .py(px(10.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_size(px(15.0))
+                    .child("Bulk Download Manager"),
+            )
+            .children(Page::ALL.iter().map(|page| {
+                let page = *page;
+                let active = self.page == page;
+                Button::new(("nav", page as usize))
+                    .label(page.title())
+                    .when(active, |button| button.primary())
+                    .when(!active, |button| button.ghost())
+                    .w_full()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.switch_page(page);
+                        cx.notify();
+                    }))
+            }))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .px(px(8.0))
+                    .py(px(8.0))
+                    .text_size(px(11.0))
+                    .text_color(palette.text_muted)
+                    .child(if self.events_connected {
+                        "Engine connected"
+                    } else {
+                        "Engine disconnected"
+                    }),
+            );
+
+        let toolbar = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(12.0))
+            .border_b_1()
+            .border_color(palette.border)
+            .bg(palette.window)
+            .px(px(20.0))
+            .py(px(12.0))
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(px(13.0))
+                    .child(self.page.title().to_string()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(14.0))
+                    .text_size(px(12.0))
+                    .text_color(palette.text_muted)
+                    .child(format!("{} active", self.active_count()))
+                    .child(format_speed_label(self.total_speed()))
+                    .child(
+                        Button::new("quit")
+                            .ghost()
+                            .label("Quit")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.request_quit() {
+                                    cx.quit();
+                                }
+                            })),
+                    ),
+            );
+
+        let content = match self.page {
+            Page::Dashboard => dashboard::show(self, window, cx).into_any_element(),
+            Page::Queue => queue_view::show(self, window, cx).into_any_element(),
+            Page::AddDownloads => add_downloads::show(self, window, cx).into_any_element(),
+            Page::History => history_view::show(self, window, cx).into_any_element(),
+            Page::Discover => discover::show(self, window, cx).into_any_element(),
+            Page::Settings => settings_view::show(self, window, cx).into_any_element(),
+            Page::AiFinder => ai_file_finder::show(self, window, cx).into_any_element(),
         };
-        ctx.request_repaint_after(delay);
-    }
-}
 
-/// Compact live activity summary for the bottom of the navigation rail.
-///
-/// Counts come from [`state::QueueState::activity_counts`], the same rows the
-/// Queue page renders; zero categories are omitted and an all-zero queue reads
-/// as idle.
-fn activity_summary(ui: &mut Ui, counts: state::ActivityCounts, palette: theme::Palette) {
-    components::glass_panel(ui, components::GlassLevel::Secondary)
-        .inner_margin(Margin::symmetric(
-            theme::SPACE_2 as i8,
-            theme::SPACE_2 as i8,
-        ))
-        .corner_radius(theme::RADIUS_INPUT)
-        .without_shadow()
-        .show(ui, |ui| {
-            ui.set_width(NAV_WIDTH - 2.0 * theme::SPACE_3 - 2.0 * theme::SPACE_2);
-            ui.spacing_mut().item_spacing.y = 2.0;
-
-            if counts.active == 0 && counts.queued == 0 && counts.failed == 0 {
-                activity_row(ui, palette.muted, "Idle", palette.muted);
-                return;
-            }
-            if counts.active > 0 {
-                activity_row(
-                    ui,
-                    palette.cyan,
-                    &format!("{} active", counts.active),
-                    palette.text_secondary,
-                );
-            }
-            if counts.queued > 0 {
-                activity_row(
-                    ui,
-                    palette.warning,
-                    &format!("{} queued", counts.queued),
-                    palette.text_secondary,
-                );
-            }
-            if counts.failed > 0 {
-                activity_row(
-                    ui,
-                    palette.error,
-                    &format!("{} failed", counts.failed),
-                    palette.text_secondary,
-                );
-            }
-        });
-}
-
-/// One dot-plus-count row inside the activity summary.
-fn activity_row(ui: &mut Ui, dot: Color32, text: &str, text_color: Color32) {
-    ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-        ui.painter().circle_filled(rect.center(), 3.5, dot);
-        ui.label(
-            RichText::new(text)
-                .size(theme::SMALL_SIZE)
-                .color(text_color),
-        );
-    });
-}
-
-/// Concentric falloff rings per ambient blob: size multiplier and the share of
-/// the blob's alpha it carries. The widest ring is the faintest, so the blob
-/// fades into the background instead of ending on a visible contour. Six rings
-/// keep the per-step delta below ~2% alpha, which reads as a smooth glow.
-const AMBIENT_RINGS: [(f32, f32); 6] = [
-    (1.62, 0.08),
-    (1.44, 0.12),
-    (1.26, 0.15),
-    (1.08, 0.19),
-    (0.90, 0.21),
-    (0.72, 0.25),
-];
-
-/// Static ambient glass wash painted across the whole window.
-///
-/// The large corner blobs are fixed in place, low-alpha and painted once per
-/// frame; the floating panel and every card on top are opaque enough that
-/// readability never depends on them.
-fn paint_ambient_background(painter: &egui::Painter, rect: Rect, palette: theme::Palette) {
-    let painter = painter.with_clip_rect(rect);
-    let width = rect.width();
-    let height = rect.height();
-    let blobs = [
-        // Indigo wash anchored to the top-left corner.
-        (
-            egui::pos2(rect.left() + width * 0.10, rect.top() + height * 0.02),
-            egui::vec2(width * 1.05, height * 0.85),
-            palette.ambient_indigo,
-            76,
-        ),
-        // Violet wash anchored to the top-right corner.
-        (
-            egui::pos2(rect.right() - width * 0.02, rect.top() + height * 0.12),
-            egui::vec2(width * 0.90, height * 0.95),
-            palette.ambient_violet,
-            72,
-        ),
-        // Cyan wash along the bottom-left corner.
-        (
-            egui::pos2(rect.left() + width * 0.04, rect.bottom() - height * 0.02),
-            egui::vec2(width * 0.80, height * 0.65),
-            palette.ambient_cyan,
-            52,
-        ),
-        // Cyan wash along the bottom-right corner.
-        (
-            egui::pos2(rect.right() - width * 0.02, rect.bottom() - height * 0.01),
-            egui::vec2(width * 0.70, height * 0.55),
-            palette.ambient_cyan,
-            44,
-        ),
-    ];
-
-    for (center, size, color, alpha) in blobs {
-        for (scale, share) in AMBIENT_RINGS {
-            let ring_alpha = (alpha as f32 * share).round().clamp(1.0, 255.0) as u8;
-            let fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), ring_alpha);
-            painter.rect_filled(
-                Rect::from_center_size(center, size * scale),
-                CornerRadius::same(255),
-                fill,
+        let mut root = div()
+            .flex()
+            .size_full()
+            .bg(palette.window)
+            .text_color(palette.text)
+            .child(nav)
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .child(toolbar)
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_y_scrollbar()
+                            .p(px(20.0))
+                            .child(content),
+                    ),
             );
+
+        root = root.child(self.toast_layer(palette));
+        if let Some(confirmation) = self.confirmation.clone() {
+            root = root.child(self.confirmation_layer(confirmation, palette, cx));
         }
+        root
     }
 }
 
-/// A one-pixel hairline across the current UI.
-fn separator(ui: &mut Ui, palette: theme::Palette) {
-    let rect = ui.available_rect_before_wrap();
-    let y = rect.top() + 0.5;
-    ui.painter().line_segment(
-        [pos2(rect.left(), y), pos2(rect.right(), y)],
-        Stroke::new(1.0, palette.border),
-    );
-    ui.allocate_exact_size(vec2(rect.width(), 1.0), Sense::hover());
+impl App {
+    fn toast_layer(&self, palette: Palette) -> Div {
+        let items = self.notifications.items();
+        div()
+            .absolute()
+            .top(px(16.0))
+            .right(px(16.0))
+            .w(px(360.0))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .children(items.iter().map(|notification| {
+                let color = theme::severity_color(notification.severity, palette);
+                div()
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(color)
+                    .bg(palette.surface)
+                    .p(px(12.0))
+                    .text_size(px(12.0))
+                    .text_color(palette.text)
+                    .child(notification.text.clone())
+            }))
+    }
+
+    fn confirmation_layer(
+        &self,
+        confirmation: Confirmation,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let title = confirmation.title().to_string();
+        let message = confirmation.message();
+        let accept = confirmation.accept_label().to_string();
+        let dangerous = confirmation.is_destructive();
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000099))
+            .child(
+                div()
+                    .w(px(420.0))
+                    .rounded(px(12.0))
+                    .border_1()
+                    .border_color(palette.border)
+                    .bg(palette.surface)
+                    .p(px(20.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(15.0))
+                            .child(title),
+                    )
+                    .child(div().text_size(px(12.0)).child(message))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(8.0))
+                            .child(
+                                Button::new("confirm-cancel")
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, _, _cx| {
+                                        this.confirmation = None;
+                                    })),
+                            )
+                            .child(
+                                Button::new("confirm-accept")
+                                    .label(accept)
+                                    .when(dangerous, |button| button.danger())
+                                    .when(!dangerous, |button| button.primary())
+                                    .on_click(cx.listener(|this, action, _, cx| {
+                                        let _ = action;
+                                        let pending = this.confirmation.take();
+                                        if let Some(pending) = pending {
+                                            if this.accept_confirmation(pending) {
+                                                cx.quit();
+                                            }
+                                        }
+                                    })),
+                            ),
+                    ),
+            )
+    }
 }
 
-/// One sidebar navigation row: painted icon, label, hover and selected state.
-fn nav_item(
-    ui: &mut Ui,
-    page: Page,
-    selected: bool,
-    badge: Option<&str>,
-    palette: theme::Palette,
-) -> Response {
-    let height = 38.0;
-    let width = ui.available_width();
-    let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
-    let item = rect.shrink2(vec2(theme::SPACE_2, 2.0));
-
-    let fill = if selected {
-        palette.accent.gamma_multiply(0.16)
-    } else if response.hovered() {
-        palette.hover
+fn format_speed_label(speed: f64) -> String {
+    if speed <= 0.0 {
+        "—".to_string()
     } else {
-        Color32::TRANSPARENT
-    };
-    let painter = ui.painter();
-    painter.rect_filled(item, CornerRadius::same(theme::RADIUS_INPUT), fill);
-
-    if selected {
-        let indicator =
-            Rect::from_min_size(pos2(item.left(), item.center().y - 9.0), vec2(3.0, 18.0));
-        painter.rect_filled(indicator, CornerRadius::same(2), palette.accent);
-    }
-
-    let icon_color = if selected || response.hovered() {
-        palette.text
-    } else {
-        palette.text_secondary
-    };
-    let icon_rect =
-        Rect::from_center_size(pos2(item.left() + 20.0, item.center().y), vec2(16.0, 16.0));
-    paint_page_icon(painter, icon_rect, page, icon_color);
-
-    let label_color = if selected {
-        palette.text
-    } else {
-        palette.text_secondary
-    };
-    painter.text(
-        pos2(item.left() + 38.0, item.center().y),
-        Align2::LEFT_CENTER,
-        page.title(),
-        FontId::proportional(theme::BODY_SIZE),
-        label_color,
-    );
-
-    if let Some(badge) = badge {
-        let pill_width = if badge.len() > 2 { 34.0 } else { 22.0 };
-        let pill = Rect::from_center_size(
-            pos2(item.right() - 20.0, item.center().y),
-            vec2(pill_width, 18.0),
-        );
-        painter.rect_filled(pill, CornerRadius::same(9), palette.accent);
-        painter.text(
-            pill.center(),
-            Align2::CENTER_CENTER,
-            badge,
-            FontId::proportional(10.0),
-            palette.on_accent,
-        );
-    }
-
-    response.on_hover_text(page.shortcut())
-}
-
-/// Geometric logo mark: a folder/tray with a download arrow.
-fn paint_logo(painter: &egui::Painter, rect: Rect, palette: theme::Palette) {
-    let mark = rect.shrink(1.0);
-    painter.rect_filled(
-        mark,
-        CornerRadius::same(theme::RADIUS_INPUT),
-        palette.accent.gamma_multiply(0.18),
-    );
-
-    let stroke = Stroke::new(2.0, palette.accent_hover);
-    let center = mark.center();
-    painter.line_segment(
-        [
-            pos2(center.x, mark.top() + 7.0),
-            pos2(center.x, mark.bottom() - 13.0),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            pos2(center.x - 4.5, mark.bottom() - 17.5),
-            pos2(center.x, mark.bottom() - 13.0),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            pos2(center.x + 4.5, mark.bottom() - 17.5),
-            pos2(center.x, mark.bottom() - 13.0),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            pos2(mark.left() + 7.0, mark.bottom() - 7.0),
-            pos2(mark.right() - 7.0, mark.bottom() - 7.0),
-        ],
-        stroke,
-    );
-}
-
-/// Consistent painted vector glyphs for the navigation rail.
-fn paint_page_icon(painter: &egui::Painter, rect: Rect, page: Page, color: Color32) {
-    let stroke = Stroke::new(1.6, color);
-    let center = rect.center();
-
-    match page {
-        Page::Dashboard => {
-            let size = 6.0;
-            let step = 5.0;
-            for (dx, dy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-                let square = Rect::from_center_size(
-                    pos2(center.x + dx * step, center.y + dy * step),
-                    vec2(size, size),
-                );
-                painter.rect_filled(square, CornerRadius::same(1), color);
-            }
-        }
-        Page::AddDownloads => {
-            painter.line_segment(
-                [
-                    pos2(center.x - 5.5, center.y),
-                    pos2(center.x + 5.5, center.y),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    pos2(center.x, center.y - 5.5),
-                    pos2(center.x, center.y + 5.5),
-                ],
-                stroke,
-            );
-        }
-        Page::Discover => {
-            painter.circle_stroke(pos2(center.x - 1.5, center.y - 1.5), 4.5, stroke);
-            painter.line_segment(
-                [
-                    pos2(center.x + 1.8, center.y + 1.8),
-                    pos2(center.x + 6.0, center.y + 6.0),
-                ],
-                Stroke::new(1.8, color),
-            );
-        }
-        Page::AiFinder => {
-            // A four-point sparkle: the assistant marker for this page.
-            for (dx, dy) in [(0.0, -6.0), (6.0, 0.0), (0.0, 6.0), (-6.0, 0.0)] {
-                let tip = pos2(center.x + dx, center.y + dy);
-                let left = pos2(center.x + dy * 0.35, center.y - dx * 0.35);
-                let right = pos2(center.x - dy * 0.35, center.y + dx * 0.35);
-                painter.line_segment([left, tip], Stroke::new(1.4, color));
-                painter.line_segment([tip, right], Stroke::new(1.4, color));
-            }
-            painter.circle_filled(center, 1.6, color);
-        }
-        Page::Queue => {
-            for offset in [-4.5, 0.0, 4.5] {
-                painter.circle_filled(pos2(center.x - 5.5, center.y + offset), 1.3, color);
-                painter.line_segment(
-                    [
-                        pos2(center.x - 2.0, center.y + offset),
-                        pos2(center.x + 6.0, center.y + offset),
-                    ],
-                    stroke,
-                );
-            }
-        }
-        Page::History => {
-            painter.circle_stroke(center, 5.5, stroke);
-            painter.line_segment([center, pos2(center.x, center.y - 3.0)], stroke);
-            painter.line_segment([center, pos2(center.x + 2.6, center.y + 1.0)], stroke);
-        }
-        Page::Settings => {
-            for (offset, knob) in [(-4.0, 2.5), (4.0, -2.0)] {
-                let y = center.y + offset;
-                painter.line_segment([pos2(center.x - 6.0, y), pos2(center.x + 6.0, y)], stroke);
-                painter.circle_filled(pos2(center.x + knob, y), 2.0, color);
-            }
-        }
-    }
-}
-
-/// Apply the stored theme preference.
-///
-/// Every variant installs the Midnight Indigo style pair first, so switching
-/// themes only changes which of the two palettes is active and never resets
-/// any widget, settings or download state.
-pub(crate) fn apply_theme(ctx: &egui::Context, theme_preference: crate::config::Theme) {
-    match theme_preference {
-        crate::config::Theme::Dark => theme::apply_dark(ctx),
-        crate::config::Theme::Light => theme::apply_light(ctx),
-        crate::config::Theme::System => theme::apply_system(ctx),
-    }
-}
-
-impl eframe::App for BulkDownloadApp {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-
-        if ctx.input(|input| input.viewport().close_requested()) && !self.quit_requested {
-            if self.active_count() > 0 {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.confirm(Confirmation::QuitWithActive {
-                    count: self.active_count(),
-                });
-            } else {
-                self.quit_requested = true;
-            }
-        }
-
-        self.drain_events(&ctx);
-        self.handle_shortcuts(&ctx);
-
-        if self.history_dirty && self.page == Page::History {
-            self.request_history();
-        }
-        if self.dashboard_dirty && self.page == Page::Dashboard {
-            self.request_dashboard();
-        }
-
-        let now = std::time::Instant::now();
-        let delta = now.duration_since(self.last_tick());
-        self.notifications
-            .tick(delta.min(Duration::from_millis(500)));
-
-        // Anchor the shell to the real viewport rect: the root `Ui` can be
-        // inset from the framebuffer, which used to leave an unpainted band
-        // below the status strip.
-        let full = ui.ctx().content_rect();
-        let palette = theme::palette(ui);
-
-        // The window is the deep navy field; the ambient wash spans all of it
-        // so the glow stays visible in the margin around the floating panel.
-        ui.painter()
-            .rect_filled(full, CornerRadius::ZERO, palette.bg);
-        paint_ambient_background(ui.painter(), full, palette);
-
-        // Floating glass panel, inset from the window edges.
-        let panel = full.shrink(PANEL_MARGIN);
-        let panel_radius = CornerRadius::same(PANEL_RADIUS);
-        // A tight shadow keeps the ambient glow visible in the outer margin.
-        for (spread, alpha) in [(7.0_f32, 16_u8), (2.0, 26)] {
-            let radius = (f32::from(PANEL_RADIUS) + spread * 0.5).round() as u8;
-            ui.painter().rect_filled(
-                panel.expand(spread).translate(vec2(0.0, 3.0)),
-                CornerRadius::same(radius),
-                Color32::from_black_alpha(alpha),
-            );
-        }
-        // Slight translucency lets the ambient field tint the glass edges while
-        // every card on top stays opaque.
-        let panel_fill = Color32::from_rgba_unmultiplied(
-            palette.surface.r(),
-            palette.surface.g(),
-            palette.surface.b(),
-            220,
-        );
-        ui.painter().rect_filled(panel, panel_radius, panel_fill);
-        ui.painter().rect_stroke(
-            panel,
-            panel_radius,
-            Stroke::new(1.0, palette.border),
-            egui::StrokeKind::Inside,
-        );
-
-        let nav_rect = Rect::from_min_size(
-            panel.min,
-            egui::vec2(NAV_WIDTH, panel.height() - STATUS_HEIGHT),
-        );
-        let page_rect = Rect::from_min_max(
-            egui::pos2(panel.left() + NAV_WIDTH, panel.top()),
-            egui::pos2(panel.right(), panel.bottom() - STATUS_HEIGHT),
-        );
-        let status_rect = Rect::from_min_size(
-            egui::pos2(panel.left(), panel.bottom() - STATUS_HEIGHT),
-            egui::vec2(panel.width(), STATUS_HEIGHT),
-        );
-
-        // Darker rail and status strips inside the panel. They carry the
-        // panel's radius only on the outer corners.
-        ui.painter().rect_filled(
-            nav_rect,
-            CornerRadius {
-                nw: PANEL_RADIUS,
-                sw: PANEL_RADIUS,
-                ne: 0,
-                se: 0,
-            },
-            palette.sidebar,
-        );
-        ui.painter().rect_filled(
-            status_rect,
-            CornerRadius {
-                nw: 0,
-                ne: 0,
-                sw: PANEL_RADIUS,
-                se: PANEL_RADIUS,
-            },
-            palette.sidebar,
-        );
-
-        // egui clip rects are rectangular, so shrink past the rounded corners;
-        // the panel fill already provides the rounded silhouette.
-        let clip = panel.shrink(3.0);
-
-        ui.scope_builder(UiBuilder::new().max_rect(nav_rect), |ui| {
-            ui.set_clip_rect(clip);
-            self.nav(ui);
-        });
-
-        ui.scope_builder(UiBuilder::new().max_rect(page_rect), |ui| {
-            ui.set_clip_rect(clip);
-            egui::Frame::new()
-                .inner_margin(Margin::symmetric(
-                    theme::SPACE_6 as i8,
-                    theme::SPACE_5 as i8,
-                ))
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            // Never let the content column claim more width
-                            // than the panel actually has (sidebar included).
-                            let available = ui.available_width();
-                            let content_width = available.min(CONTENT_MAX_WIDTH);
-                            let padding = ((available - content_width) / 2.0).max(0.0);
-                            ui.horizontal(|ui| {
-                                ui.add_space(padding);
-                                ui.vertical(|ui| {
-                                    ui.set_width(content_width);
-                                    ui.set_max_width(content_width);
-                                    self.render_page(ui);
-                                    ui.add_space(theme::SPACE_6);
-                                });
-                            });
-                        });
-                });
-        });
-
-        ui.scope_builder(UiBuilder::new().max_rect(status_rect), |ui| {
-            ui.set_clip_rect(clip);
-            self.status_bar(ui);
-        });
-
-        self.toasts(ui, panel);
-        self.render_confirmation(ui, full);
-        self.mark_tick(now);
-        self.schedule_repaint(&ctx);
+        format::format_speed(Some(speed))
     }
 }
