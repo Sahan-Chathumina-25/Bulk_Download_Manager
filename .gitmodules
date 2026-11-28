@@ -1,0 +1,3 @@
+[submodule "vendor/adblock-rust"]
+	path = vendor/adblock-rust
+	url = https://github.com/brave/adblock-rust.git
