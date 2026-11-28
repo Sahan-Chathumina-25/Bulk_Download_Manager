@@ -1,231 +1,194 @@
 //! Add Downloads: paste URLs, review them, then queue them.
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::input::{Input, Textarea};
-use gpui_kit::component::{Disableable as _, IconName};
-use gpui_kit::*;
+use dioxus::prelude::*;
 
-use super::{App, components, theme};
+use crate::app::{components, state::Severity, use_ui};
 use crate::app::backend::Command;
 
-pub fn show(app: &App, window: &mut Window, cx: &mut Context<App>) -> impl IntoElement {
-    let palette = theme::palette(window, cx);
-    let single_url = app.add_line_count == 1;
+#[component]
+pub fn AddDownloads() -> Element {
+    let mut ui = use_ui();
 
-    let form = div()
-        .flex()
-        .flex_col()
-        .gap(px(12.0))
-        .child(components::section_title("Download URLs", palette.text))
-        .child(
-            div()
-                .rounded(px(10.0))
-                .border_1()
-                .border_color(palette.border)
-                .bg(palette.surface_alt)
-                .child(Textarea::new(&app.add_urls).h(px(150.0))),
+    let (urls, filename, checksum, destination, single_url, start_now, pending, previewing, error, preview, outcome) = {
+        let model = ui.model.read();
+        (
+            model.add_urls.clone(),
+            model.add_filename.clone(),
+            model.add_checksum.clone(),
+            destination_label(&model.settings.default_destination_dir, model.add.destination.as_ref()),
+            model.add_line_count == 1,
+            model.add.start_immediately,
+            model.add.add_pending,
+            model.add.preview_pending,
+            model.add.error.clone(),
+            model.add.preview.as_ref().map(|preview| (
+                preview.accepted.len(),
+                preview.duplicates.len(),
+                preview.rejected.len(),
+                preview.rejected.iter().take(5)
+                    .map(|(line, reason)| format!("{line}: {reason}"))
+                    .collect::<Vec<_>>(),
+            )),
+            model.add.outcome.clone(),
         )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(12.0))
-                .child(
-                    Button::new("add-pick-folder")
-                        .icon(IconName::Folder)
-                        .label("Destination")
-                        .on_click(cx.listener(|this, _, _, cx| {
+    };
+
+    rsx! {
+        components::PageHeader {
+            title: "Add Downloads".to_string(),
+            subtitle: "Paste URLs, review them, then add them to the queue.".to_string(),
+        }
+        components::Card {
+            section { class: "column",
+                components::SectionTitle { text: "Download URLs".to_string(), tone: "".to_string() }
+                textarea {
+                    value: "{urls}",
+                    placeholder: "One download URL per line…",
+                    oninput: move |event| {
+                        let value = event.value();
+                        let mut model = ui.model.write();
+                        model.add_line_count = count_lines(&value);
+                        model.add_urls = value;
+                    },
+                }
+                div { class: "row",
+                    button {
+                        onclick: move |_| {
                             if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                                this.add.destination = Some(folder);
-                                cx.notify();
+                                ui.model.write().add.destination = Some(folder);
                             }
-                        })),
-                )
-                .child(components::muted(destination_label(app), palette.text_muted)),
-        )
-        .child(
-            div()
-                .flex()
-                .gap(px(12.0))
-                .child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.0))
-                        .child(components::muted("File name (one URL only)", palette.text_muted))
-                        .child(Input::new(&app.add_filename).disabled(!single_url)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.0))
-                        .child(components::muted("SHA-256 (one URL only)", palette.text_muted))
-                        .child(Input::new(&app.add_checksum).disabled(!single_url)),
-                ),
-        )
-        .child(
-            Checkbox::new("add-start")
-                .label("Start downloads immediately")
-                .checked(app.add.start_immediately)
-                .on_change(cx.listener(|this, value, _, cx| {
-                    this.add.start_immediately = *value;
-                    cx.notify();
-                })),
-        )
-        .child(
-            div()
-                .flex()
-                .gap(px(8.0))
-                .child(
-                    Button::new("add-preview")
-                        .label("Preview")
-                        .disabled(app.add.preview_pending)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let text = this.add_urls.read(cx).value().to_string();
-                            this.add.preview_pending = true;
-                            this.send(Command::PreviewUrls { text });
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    Button::new("add-submit")
-                        .primary()
-                        .icon(IconName::Plus)
-                        .label("Add to queue")
-                        .disabled(app.add.add_pending)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.add.add_pending = true;
-                            let text = this.add_urls.read(cx).value().to_string();
-                            this.add_line_count = count_lines(&text);
-                            let single = this.add_line_count == 1;
-                            let filename = if single {
-                                let value = this.add_filename.read(cx).value().trim().to_string();
-                                (!value.is_empty()).then_some(value)
-                            } else {
-                                None
-                            };
-                            let checksum = if single {
-                                let value = this.add_checksum.read(cx).value().trim().to_string();
-                                (!value.is_empty()).then_some(value)
-                            } else {
-                                None
-                            };
-                            let destination = this.add.effective_destination(&this.settings);
-                            let start_now = this.add.start_immediately;
-                            this.send(Command::AddUrls {
-                                text,
-                                destination,
-                                filename,
-                                checksum,
-                                start_now,
-                            });
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    Button::new("add-import")
-                        .label("Import TXT…")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Text", &["txt"])
-                                .pick_file()
-                            {
-                                match std::fs::read_to_string(&path) {
-                                    Ok(text) => {
-                                        this.add_urls.update(cx, |state, cx| {
-                                            state.set_value(&text, window, cx);
-                                        });
-                                        this.add_line_count = count_lines(&text);
-                                    }
-                                    Err(error) => this.toast(
-                                        super::state::Severity::Error,
-                                        format!("Could not read {}: {error}", path.display()),
-                                    ),
-                                }
-                            }
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    Button::new("add-clear")
-                        .ghost()
-                        .label("Clear")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.add_urls.update(cx, |state, cx| {
-                                state.set_value("", window, cx);
-                            });
-                            this.add.clear_feedback();
-                            this.add_line_count = 0;
-                            cx.notify();
-                        })),
-                ),
-        );
-
-    let mut column = div()
-        .flex()
-        .flex_col()
-        .gap(px(18.0))
-        .child(components::page_header(
-            "Add Downloads",
-            "Paste URLs, review them, then add them to the queue.",
-        ))
-        .child(
-            components::card(form, palette)
-        );
-
-    if let Some(error) = &app.add.error {
-        column = column.child(
-            div()
-                .text_size(px(12.0))
-                .text_color(palette.danger)
-                .child(error.clone()),
-        );
+                        },
+                        "Destination"
+                    }
+                    span { class: "muted", "{destination}" }
+                }
+                div { class: "row",
+                    div { class: "field grow",
+                        label { "File name (one URL only)" }
+                        input {
+                            value: "{filename}",
+                            disabled: !single_url,
+                            placeholder: "Optional file name",
+                            oninput: move |event| ui.model.write().add_filename = event.value(),
+                        }
+                    }
+                    div { class: "field grow",
+                        label { "SHA-256 (one URL only)" }
+                        input {
+                            value: "{checksum}",
+                            disabled: !single_url,
+                            placeholder: "sha256:<hex>",
+                            oninput: move |event| ui.model.write().add_checksum = event.value(),
+                        }
+                    }
+                }
+                label { class: "checkbox",
+                    input {
+                        r#type: "checkbox",
+                        checked: start_now,
+                        onchange: move |event| ui.model.write().add.start_immediately = event.checked(),
+                    }
+                    "Start downloads immediately"
+                }
+                div { class: "row",
+                    button {
+                        disabled: previewing,
+                        onclick: move |_| {
+                            let mut model = ui.model.write();
+                            model.add.preview_pending = true;
+                            let text = model.add_urls.clone();
+                            model.send(Command::PreviewUrls { text });
+                        },
+                        "Preview"
+                    }
+                    button {
+                        class: "primary",
+                        disabled: pending,
+                        onclick: move |_| submit(ui),
+                        "Add to queue"
+                    }
+                    button {
+                        onclick: move |_| import_txt(ui),
+                        "Import TXT…"
+                    }
+                    button {
+                        class: "ghost",
+                        onclick: move |_| {
+                            let mut model = ui.model.write();
+                            model.add_urls.clear();
+                            model.add_line_count = 0;
+                            model.add.clear_feedback();
+                        },
+                        "Clear"
+                    }
+                }
+            }
+        }
+        if let Some(error) = error {
+            div { class: "danger", "{error}" }
+        }
+        if let Some((accepted, duplicates, rejected, reasons)) = preview {
+            section { class: "column",
+                components::SectionTitle { text: "Preview".to_string(), tone: "".to_string() }
+                components::Muted {
+                    text: format!("{accepted} accepted · {duplicates} duplicate(s) · {rejected} rejected"),
+                    tone: "".to_string(),
+                }
+                for reason in reasons {
+                    components::Muted { text: reason, tone: "danger".to_string() }
+                }
+            }
+        }
+        if let Some(outcome) = outcome {
+            components::Muted {
+                text: format!("Added {} download(s); {} failed.", outcome.added, outcome.failed.len()),
+                tone: "".to_string(),
+            }
+        }
     }
-
-    if let Some(preview) = &app.add.preview {
-        column = column.child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(4.0))
-                .child(components::section_title("Preview", palette.text))
-                .child(components::muted(
-                    format!(
-                        "{} accepted · {} duplicate(s) · {} rejected",
-                        preview.accepted.len(),
-                        preview.duplicates.len(),
-                        preview.rejected.len()
-                    ),
-                    palette.text_muted,
-                ))
-                .children(preview.rejected.iter().take(5).map(|(line, reason)| {
-                    components::muted(format!("{line}: {reason}"), palette.danger)
-                })),
-        );
-    }
-
-    if let Some(outcome) = &app.add.outcome {
-        column = column.child(components::muted(
-            format!(
-                "Added {} download(s); {} failed.",
-                outcome.added,
-                outcome.failed.len()
-            ),
-            palette.text_muted,
-        ));
-    }
-
-    column
 }
 
-fn destination_label(app: &App) -> String {
-    match app.add.effective_destination(&app.settings) {
+fn submit(mut ui: crate::app::Ui) {
+    let mut model = ui.model.write();
+    let text = model.add_urls.clone();
+    let single = count_lines(&text) == 1;
+    let filename = single.then(|| model.add_filename.trim().to_string()).filter(|value| !value.is_empty());
+    let checksum = single.then(|| model.add_checksum.trim().to_string()).filter(|value| !value.is_empty());
+    let destination = model.add.effective_destination(&model.settings);
+    let start_now = model.add.start_immediately;
+    model.add_line_count = count_lines(&text);
+    model.add.add_pending = true;
+    model.send(Command::AddUrls {
+        text,
+        destination,
+        filename,
+        checksum,
+        start_now,
+    });
+}
+
+fn import_txt(mut ui: crate::app::Ui) {
+    let Some(path) = rfd::FileDialog::new().add_filter("Text", &["txt"]).pick_file() else {
+        return;
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let mut model = ui.model.write();
+            model.add_line_count = count_lines(&text);
+            model.add_urls = text;
+        }
+        Err(error) => ui.model.write().toast(
+            Severity::Error,
+            format!("Could not read {}: {error}", path.display()),
+        ),
+    }
+}
+
+fn destination_label(configured: &str, selected: Option<&std::path::PathBuf>) -> String {
+    match selected {
         Some(path) => path.to_string_lossy().into_owned(),
-        None => "Default download folder".to_string(),
+        None if configured.trim().is_empty() => "Default download folder".to_string(),
+        None => configured.to_string(),
     }
 }
 

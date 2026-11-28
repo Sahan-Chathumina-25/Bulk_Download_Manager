@@ -1,175 +1,166 @@
 //! Queue: the live control surface for downloads.
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::{Disableable as _, IconName};
-use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::*;
+use dioxus::prelude::*;
 
-use super::{App, components, format, theme};
+use crate::app::{components, format, theme, use_ui};
 use crate::app::backend::{Command, QueueAction};
 use crate::app::state::Confirmation;
 use crate::models::download_status::DownloadState;
 
-pub fn show(app: &App, _window: &mut Window, cx: &mut Context<App>) -> impl IntoElement {
-    let palette = theme::palette(_window, cx);
-    let selected = app.queue.selected_ids();
+struct QueueRow {
+    id: i64,
+    name: String,
+    state: String,
+    tone: &'static str,
+    checked: bool,
+    fraction: Option<f32>,
+    bytes: String,
+    speed: String,
+}
 
-    let action_button = |id: &'static str, label: &'static str, action: Option<QueueAction>| {
-        let enabled = action.is_some();
-        Button::new(id)
-            .label(label)
-            .when(enabled, |button| button.primary())
-            .when(!enabled, |button| button.disabled(true))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(action) = action {
-                    let ids = this.queue.selected_ids();
-                    if !ids.is_empty() {
-                        this.send(Command::QueueAction { ids, action });
-                        this.queue.clear_selection();
-                        cx.notify();
-                    }
-                }
-            }))
-    };
+#[component]
+pub fn Queue() -> Element {
+    let mut ui = use_ui();
 
-    let can_pause = app.queue.records().iter().any(|record| {
-        app.queue.selected().contains(&record.id.unwrap_or(-1))
-            && matches!(record.state, DownloadState::Connecting | DownloadState::Downloading)
-    });
-    let can_resume = app.queue.records().iter().any(|record| {
-        app.queue.selected().contains(&record.id.unwrap_or(-1))
-            && matches!(
-                record.state,
-                DownloadState::Paused | DownloadState::Interrupted | DownloadState::Queued
-            )
-    });
-    let can_retry = app.queue.records().iter().any(|record| {
-        app.queue.selected().contains(&record.id.unwrap_or(-1))
-            && matches!(
-                record.state,
-                DownloadState::Failed
-                    | DownloadState::Cancelled
-                    | DownloadState::Interrupted
-                    | DownloadState::Paused
-            )
-    });
-
-    let toolbar = div()
-        .flex()
-        .items_center()
-        .gap(px(8.0))
-        .pb(px(12.0))
-        .child(
-            Button::new("queue-start-all")
-                .icon(IconName::Play)
-                .label("Start all")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.send(Command::StartAll);
-                    cx.notify();
-                })),
-        )
-        .child(action_button("queue-pause", "Pause", can_pause.then_some(QueueAction::Pause)))
-        .child(action_button("queue-resume", "Resume", can_resume.then_some(QueueAction::Resume)))
-        .child(action_button("queue-retry", "Retry", can_retry.then_some(QueueAction::Retry)))
-        .child(
-            Button::new("queue-cancel")
-                .label("Cancel")
-                .disabled(selected.is_empty())
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let ids = this.queue.selected_ids();
-                    if !ids.is_empty() {
-                        this.confirm(Confirmation::CancelQueue { ids });
-                        cx.notify();
-                    }
-                })),
-        )
-        .child(
-            Button::new("queue-remove")
-                .label("Remove")
-                .disabled(selected.is_empty())
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let ids = this.queue.selected_ids();
-                    if !ids.is_empty() {
-                        this.confirm(Confirmation::RemoveQueue { ids });
-                        cx.notify();
-                    }
-                })),
-        );
-
-    let rows = app.queue.records().iter().map(|record| {
-        let id = record.id.unwrap_or(-1);
-        let checked = app.queue.selected().contains(&id);
-        let view = app.queue.view_for(record);
-        let color = theme::state_color(record.state, palette);
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .rounded(px(10.0))
-            .border_1()
-            .border_color(palette.border)
-            .bg(palette.surface)
-            .p(px(12.0))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(10.0))
-                    .child(
-                        Checkbox::new(format!("queue-select-{id}"))
-                            .checked(checked)
-                            .accessibility_label("Select download")
-                            .on_change(cx.listener(move |this, value, _, cx| {
-                                this.queue.set_selected(id, *value);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(13.0))
-                            .child(record.display_name.clone()),
-                    )
-                    .child(components::badge(theme::state_label(record.state), color, palette)),
-            )
-            .child(components::progress_bar(
-                format!("queue-progress-{id}"),
-                view.fraction,
-                color,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .text_size(px(11.0))
-                    .text_color(palette.text_muted)
-                    .child(format!(
+    let (can_pause, can_resume, can_retry, has_selection, empty, rows) = {
+        let model = ui.model.read();
+        let selected = model.queue.selected();
+        let records = model.queue.records();
+        let can = |states: &[DownloadState]| {
+            records.iter().any(|record| {
+                selected.contains(&record.id.unwrap_or(-1)) && states.contains(&record.state)
+            })
+        };
+        let rows: Vec<QueueRow> = records
+            .iter()
+            .map(|record| {
+                let id = record.id.unwrap_or(-1);
+                let view = model.queue.view_for(record);
+                QueueRow {
+                    id,
+                    name: record.display_name.clone(),
+                    state: theme::state_label(record.state).to_string(),
+                    tone: theme::state_class(record.state),
+                    checked: selected.contains(&id),
+                    fraction: view.fraction,
+                    bytes: format!(
                         "{} / {}",
                         format::format_bytes(Some(view.downloaded_bytes)),
                         format::format_bytes(view.total_bytes)
-                    ))
-                    .child(format_speed(view.speed_bps, view.eta_seconds)),
-            )
-    });
+                    ),
+                    speed: speed_label(view.speed_bps, view.eta_seconds),
+                }
+            })
+            .collect();
+        (
+            can(&[DownloadState::Connecting, DownloadState::Downloading]),
+            can(&[
+                DownloadState::Paused,
+                DownloadState::Interrupted,
+                DownloadState::Queued,
+            ]),
+            can(&[
+                DownloadState::Failed,
+                DownloadState::Cancelled,
+                DownloadState::Interrupted,
+                DownloadState::Paused,
+            ]),
+            !selected.is_empty(),
+            model.queue.is_empty(),
+            rows,
+        )
+    };
 
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(14.0))
-        .child(components::page_header("Queue", "Control active and queued downloads."))
-        .child(toolbar)
-        .children(rows)
-        .when(app.queue.is_empty(), |el| {
-            el.child(components::empty_state(
-                "The queue is empty",
-                "Use Add Downloads to bring files in.",
-                palette,
-            ))
-        })
+    rsx! {
+        components::PageHeader {
+            title: "Queue".to_string(),
+            subtitle: "Control active and queued downloads.".to_string(),
+        }
+        div { class: "row",
+            button {
+                class: "primary",
+                onclick: move |_| ui.model.write().send(Command::StartAll),
+                "Start all"
+            }
+            button {
+                disabled: !can_pause,
+                onclick: move |_| apply_action(ui, QueueAction::Pause),
+                "Pause"
+            }
+            button {
+                disabled: !can_resume,
+                onclick: move |_| apply_action(ui, QueueAction::Resume),
+                "Resume"
+            }
+            button {
+                disabled: !can_retry,
+                onclick: move |_| apply_action(ui, QueueAction::Retry),
+                "Retry"
+            }
+            button {
+                disabled: !has_selection,
+                onclick: move |_| confirm_ids(ui, false),
+                "Cancel"
+            }
+            button {
+                disabled: !has_selection,
+                onclick: move |_| confirm_ids(ui, true),
+                "Remove"
+            }
+        }
+        for row in rows {
+            article { class: "item",
+                div { class: "row",
+                    input {
+                        r#type: "checkbox",
+                        checked: row.checked,
+                        onchange: move |event| {
+                            ui.model.write().queue.set_selected(row.id, event.checked());
+                        },
+                    }
+                    span { class: "grow", "{row.name}" }
+                    components::Badge { text: row.state, tone: row.tone.to_string() }
+                }
+                components::ProgressBar { fraction: row.fraction }
+                div { class: "row between muted",
+                    span { "{row.bytes}" }
+                    span { "{row.speed}" }
+                }
+            }
+        }
+        if empty {
+            components::EmptyState {
+                title: "The queue is empty".to_string(),
+                subtitle: "Use Add Downloads to bring files in.".to_string(),
+            }
+        }
+    }
 }
 
-fn format_speed(speed: f64, eta: Option<u64>) -> String {
+fn apply_action(mut ui: crate::app::Ui, action: QueueAction) {
+    let mut model = ui.model.write();
+    let ids = model.queue.selected_ids();
+    if !ids.is_empty() {
+        model.send(Command::QueueAction { ids, action });
+        model.queue.clear_selection();
+    }
+}
+
+fn confirm_ids(mut ui: crate::app::Ui, remove: bool) {
+    let mut model = ui.model.write();
+    let ids = model.queue.selected_ids();
+    if ids.is_empty() {
+        return;
+    }
+    let confirmation = if remove {
+        Confirmation::RemoveQueue { ids }
+    } else {
+        Confirmation::CancelQueue { ids }
+    };
+    model.confirm(confirmation);
+}
+
+fn speed_label(speed: f64, eta: Option<u64>) -> String {
     if speed <= 0.0 {
         return "—".to_string();
     }

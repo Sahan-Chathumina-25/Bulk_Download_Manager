@@ -8,8 +8,9 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 chrono = "0.4.45"
+dioxus = { version = "0.7" }
 form_urlencoded = "1.2.2"
-gpui-kit = "0.11.0"
+futures-timer = "3.0"
 httpdate = "1.0.3"
 percent-encoding = "2.3.2"
 reqwest = { version = "0.13.5", features = ["stream"] }
@@ -25,6 +26,10 @@ tokio-util = { version = "0.7.20", features = ["rt"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
+
+[features]
+default = ["desktop"]
+desktop = ["dioxus/desktop"]
 
 [profile.release]
 # Slightly smaller/faster binaries; kept simple for a beginner-friendly build.
